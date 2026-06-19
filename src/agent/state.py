@@ -1,4 +1,4 @@
-from typing import TypedDict, List, Annotated
+from typing import TypedDict, List, Annotated, Optional
 import operator
 
 class AgentState(TypedDict):
@@ -12,6 +12,10 @@ class AgentState(TypedDict):
     - logs: An append-only list of execution outputs, errors, and system status messages.
     - current_step: An integer pointer indicating the active index in the 'plan'.
     - is_complete: A global flag that, when True, triggers the graph to terminate.
+    - last_error: Stores the exact error message if a step fails.
+    - retry_count: Tracks execution attempts for the current step.
+    - plan_feedback: Feedback from executor back to planner for replanning.
+    - user_feedback: Input from user if human intervention is required.
     """
     requirement: str
     plan: List[str]
@@ -19,3 +23,7 @@ class AgentState(TypedDict):
     logs: Annotated[List[str], operator.add]
     current_step: int
     is_complete: bool
+    last_error: Optional[str]
+    retry_count: int
+    plan_feedback: Optional[str]
+    user_feedback: Optional[str]

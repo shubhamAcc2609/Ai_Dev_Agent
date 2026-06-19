@@ -1,14 +1,2 @@
-# Orchestration & Graph
-langgraph>=0.2.0
-langchain-core>=0.3.0
-
-
-
-# Data Validation & Utilities
-pydantic>=2.0.0
-python-dotenv>=1.0.0
-
-
-
-# Optional (Recommended for future-proofing)
-langsmith>=0.1.0    # For tracing/debugging your agent's decision loops
+fastapi>=0.95.0
+uvicorn>=0.21.0
