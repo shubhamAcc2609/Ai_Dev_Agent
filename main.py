@@ -4,16 +4,26 @@ Main Entry Point - AI Dev Agent
 Initializes and runs the AI Dev Agent workflow.
 
 Usage:
-    python main.py
-    
-    Or import and use:
-    from main import run_agent
-    result = run_agent("Create a FastAPI server")
+    python main.py                                    # Interactive mode
+    python main.py --requirement "Create a Flask app" # Single requirement
+    python main.py --example 0                        # Predefined example
+    python main.py --verbose                          # Full execution trace
+    python main.py --quiet                            # Summary only
+    python main.py --list-examples                    # Show examples
 """
 
+from __future__ import annotations
+
+import argparse
 import sys
+import textwrap
+from typing import List
+
 from src.agent.state import AgentState
 
+# ---------------------------------------------------------------------------
+# Console setup
+# ---------------------------------------------------------------------------
 
 def _configure_console_encoding() -> None:
     for stream in (sys.stdout, sys.stderr):
@@ -24,42 +34,171 @@ def _configure_console_encoding() -> None:
 _configure_console_encoding()
 
 
-def run_agent(requirement: str, verbose: bool = True) -> dict:
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+EXAMPLE_REQUIREMENTS = [
+    "Create a simple 'Hello World' Python script",
+    "Create a Flask web server with /api/users endpoint",
+    "Create a FastAPI server with POST /data endpoint",
+    "A python program to find the largest number in a list without using sorting",
+    "A CLI tool that counts word frequency in a text file",
+]
+
+# Markers in log lines that indicate proof of verification
+VERIFICATION_MARKERS = (
+    "Verified live:",        # server probe succeeded
+    "Endpoint responded:",   # HTTP probe succeeded
+    "[verified:",            # generic verification summary in step-complete line
+    "Command ok.",           # plain command exited cleanly
+)
+
+# Markers that indicate things to highlight as warnings
+WARNING_MARKERS = (
+    "ERROR RECOVERY",
+    "✗",
+    "CRITICAL ERROR",
+    "Server verification failed",
+    "Validation failed",
+    "Catastrophic error",
+)
+
+
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+
+def _print_header(title: str, width: int = 70) -> None:
+    print("=" * width)
+    print(title)
+    print("=" * width)
+
+
+def _print_section(title: str, width: int = 70) -> None:
+    print()
+    print("-" * width)
+    print(title)
+    print("-" * width)
+
+
+def _filter_lines(lines: List[str], markers: tuple) -> List[str]:
+    """Return lines that contain any of the given markers."""
+    return [ln for ln in lines if any(marker in ln for marker in markers)]
+
+
+def _format_status(final_status: str, is_complete: bool, last_error) -> str:
+    """Normalize the agent's status into a single human label."""
+    status = (final_status or "").lower()
+    if status == "success":
+        return "SUCCESS"
+    if status == "failed":
+        return "FAILED"
+    if status == "in_progress" or (is_complete and not last_error):
+        return "SUCCESS"
+    if is_complete and last_error:
+        return "FAILED"
+    return "INCOMPLETE"
+
+
+def _exit_code_for_status(status_label: str) -> int:
+    return {"SUCCESS": 0, "FAILED": 2, "INCOMPLETE": 3}.get(status_label, 1)
+
+
+# ---------------------------------------------------------------------------
+# Result rendering
+# ---------------------------------------------------------------------------
+
+def _render_results(result: dict, verbose: bool) -> str:
+    """Render the agent result to stdout and return the status label."""
+    plan = result.get("plan", []) or []
+    files = result.get("files", []) or []
+    logs = result.get("logs", []) or []
+    last_error = result.get("last_error")
+    is_complete = result.get("is_complete", False)
+    final_status = result.get("final_status", "")
+
+    status_label = _format_status(final_status, is_complete, last_error)
+
+    print()
+    _print_header("*** AI DEV AGENT - EXECUTION COMPLETE ***")
+
+    print(f"\nStatus       : {status_label}")
+    print(f"Plan Steps   : {len(plan)}")
+    print(f"Files Created: {len(files)}")
+    print(f"Log Entries  : {len(logs)}")
+
+    # ---- Files ----------------------------------------------------------
+    if files:
+        print("\n[FILES CREATED]")
+        for path in files:
+            print(f"  - {path}")
+
+    # ---- Plan -----------------------------------------------------------
+    if plan:
+        print("\n[PLAN]")
+        for i, step in enumerate(plan, 1):
+            print(f"  {i}. {textwrap.shorten(step, width=140, placeholder='…')}")
+
+    # ---- Verification proof --------------------------------------------
+    verifications = _filter_lines(logs, VERIFICATION_MARKERS)
+    if verifications:
+        print("\n[VERIFICATION PROOF]")
+        for line in verifications:
+            print(f"  ✓ {line.lstrip('✓ ').strip()}")
+    else:
+        print("\n[VERIFICATION PROOF]")
+        print("  (none — no command or server probe succeeded explicitly)")
+
+    # ---- Warnings -------------------------------------------------------
+    warnings = _filter_lines(logs, WARNING_MARKERS)
+    if warnings:
+        print("\n[WARNINGS / ERRORS]")
+        for line in warnings:
+            print(f"  ⚠ {line.strip()}")
+
+    # ---- Last error -----------------------------------------------------
+    if last_error:
+        print(f"\n[LAST ERROR]\n  {last_error}")
+
+    # ---- Full trace -----------------------------------------------------
+    if verbose:
+        print("\n[FULL EXECUTION TRACE]")
+        for i, entry in enumerate(logs, 1):
+            print(f"  {i:>3}. {entry}")
+
+    print()
+    _print_header(f"FINAL STATUS: {status_label}")
+    return status_label
+
+
+# ---------------------------------------------------------------------------
+# Public runner
+# ---------------------------------------------------------------------------
+
+def run_agent(
+    requirement: str,
+    verbose: bool = False,
+    exit_on_finish: bool = False,
+) -> dict:
     """
-    Runs the AI Dev Agent with the given requirement.
-    
-    Workflow:
-    1. Initialize state with requirement
-    2. Invoke graph (Planner → Executor loop)
-    3. Return final state with results, logs, and files
-    
+    Run the AI Dev Agent with the given requirement.
+
     Args:
-        requirement: Natural language description of what to build/do
-        verbose: Whether to print detailed execution logs
-    
+        requirement: Natural-language description of what to build.
+        verbose: When True, print the full execution log (every entry).
+                 When False, print only summary + verification proof + warnings.
+        exit_on_finish: When True, `sys.exit()` with a status-derived code.
+
     Returns:
-        dict: Final agent state with:
-            - plan: Generated steps
-            - files: Created files
-            - logs: Execution logs
-            - is_complete: Whether task completed
-            - last_error: Any final error (if failed)
-    
-    Example:
-        result = run_agent("Create a Python Flask app with /hello endpoint")
-        print(f"Files created: {result['files']}")
-        print(f"Success: {result['is_complete']}")
+        The agent's final state dict (including `final_status` field).
     """
-    
     if not requirement or not requirement.strip():
         raise ValueError("Requirement cannot be empty")
-    
-    print("="*70)
-    print("*** AI DEV AGENT - STARTING ***")
-    print("="*70)
+
+    _print_header("*** AI DEV AGENT - STARTING ***")
     print(f"\nRequirement: {requirement}\n")
-    
-    # ========== INITIALIZE STATE ==========
+
     initial_state = AgentState(
         requirement=requirement,
         plan=[],
@@ -70,194 +209,168 @@ def run_agent(requirement: str, verbose: bool = True) -> dict:
         last_error=None,
         retry_count=0,
         plan_feedback=None,
-        user_feedback=None
+        user_feedback=None,
     )
-    
+
     print("Initializing workflow...")
     print(f"State initialized with requirement: '{requirement}'")
-    
-    # ========== INVOKE GRAPH ==========
+
     try:
         print("\nInvoking graph workflow...\n")
         from src.agent.graph import graph
-        
         result = graph.invoke(initial_state)
-        
-        # ========== PRINT RESULTS ==========
-        print("\n" + "="*70)
-        print("*** AI DEV AGENT - EXECUTION COMPLETE ***")
-        print("="*70)
-        
-        is_complete = result.get("is_complete", False)
-        plan = result.get("plan", [])
-        files = result.get("files", [])
-        #logs = result.get("logs", [])
-        last_error = result.get("last_error")
-        
-        print(f"\nStatus: {'SUCCESS' if is_complete else 'INCOMPLETE'}")
-        print(f"Plan Steps: {len(plan)}")
-        print(f"Files Created: {len(files)}")
-       #print(f"Logs: {len(logs)} entries")
-        
-        if files:
-            print("\n[FILES CREATED]:")
-            for file_path in files:
-                print(f"  - {file_path}")
-        
-        if last_error:
-            print(f"\n[WARNING] Last Error: {last_error}")
-        
-        #if verbose and logs:
-           # print("\n[EXECUTION LOGS]:")
-           # for i, log in enumerate(logs, 1):
-           #     print(f"  {i}. {log}")
-        
-        print("\n" + "="*70)
-        
-        return result
-    
     except KeyboardInterrupt:
         print("\n\n[WARNING] Agent interrupted by user (Ctrl+C)")
-        sys.exit(1)
-    
-    except Exception as e:
-        print(f"\n\n[ERROR] FATAL ERROR: {str(e)}")
+        if exit_on_finish:
+            sys.exit(130)
+        raise
+    except Exception as exc:
+        print(f"\n\n[ERROR] FATAL ERROR: {exc}")
         import traceback
         traceback.print_exc()
-        sys.exit(1)
+        if exit_on_finish:
+            sys.exit(1)
+        raise
+
+    status_label = _render_results(result, verbose=verbose)
+    result["status_label"] = status_label
+
+    if exit_on_finish:
+        sys.exit(_exit_code_for_status(status_label))
+
+    return result
 
 
-def main():
-    """
-    Interactive CLI for the AI Dev Agent.
-    """
-    print("\n" + "="*70)
-    print("AI DEV AGENT - INTERACTIVE CLI")
-    print("="*70)
-    print("\nEnter your development requirement (or 'quit' to exit):")
-    print("-"*70)
-    
+# ---------------------------------------------------------------------------
+# Interactive mode
+# ---------------------------------------------------------------------------
+
+def main_interactive() -> None:
+    """Interactive CLI loop."""
+    _print_header("AI DEV AGENT - INTERACTIVE CLI")
+    print("\nEnter your development requirement (or 'quit' to exit).")
+    print("Type 'verbose' before a requirement to see the full trace, e.g.:")
+    print("    verbose Create a Flask hello world app")
+    print("-" * 70)
+
     while True:
         try:
-            requirement = input("\n[INPUT] Requirement: ").strip()
+            raw = input("\n[INPUT] Requirement: ").strip()
         except EOFError:
             print("\n[INFO] No interactive input was provided.")
-            print('[INFO] Run with --requirement "Create a Hello World Python script" for non-interactive mode.')
             break
         except KeyboardInterrupt:
             print("\n\n[INFO] Goodbye!")
             break
 
-        if requirement.lower() in ("quit", "exit", "q"):
+        if not raw:
+            print("[ERROR] Please enter a requirement.")
+            continue
+
+        if raw.lower() in ("quit", "exit", "q"):
             print("[INFO] Goodbye!")
             break
 
-        if not requirement:
-            print("[ERROR] Please enter a requirement")
+        verbose_run = False
+        if raw.lower().startswith("verbose "):
+            verbose_run = True
+            raw = raw[len("verbose "):].strip()
+
+        try:
+            run_agent(raw, verbose=verbose_run, exit_on_finish=False)
+        except Exception as exc:
+            print(f"\n[ERROR] Run failed: {exc}")
             continue
 
-        run_agent(requirement, verbose=True)
-
-        print("\n" + "-"*70)
+        print("\n" + "-" * 70)
         try:
-            user_input = input("[INPUT] Continue? (yes/no/modify): ").strip().lower()
-        except EOFError:
-            print("\n[INFO] No follow-up input was provided. Exiting.")
+            cont = input("[INPUT] Continue? (yes/no): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n[INFO] Goodbye!")
             break
-        except KeyboardInterrupt:
-            print("\n\n[INFO] Goodbye!")
+        if cont.startswith("n"):
+            print("[INFO] Goodbye!")
             break
 
-        if user_input.startswith("no"):
-            break
-        elif user_input.startswith("mod"):
-            print("\n[INFO] Modifying state for next iteration...")
-            # Could add feedback logic here
 
+# ---------------------------------------------------------------------------
+# Examples
+# ---------------------------------------------------------------------------
 
-# ========== EXAMPLE REQUIREMENTS ==========
-EXAMPLE_REQUIREMENTS = [
-    "Create a simple 'Hello World' Python script",
-    "Create a Flask web server with /api/users endpoint",
-    "Create a FastAPI server with POST /data endpoint",
-    "Create a requirements.txt with common Python packages",
-    "Create a README.md with project documentation",
-]
-
-
-def run_example(example_index: int = 0):
-    """
-    Runs a predefined example.
-    
-    Args:
-        example_index: Index of example (0-4)
-    """
+def run_example(example_index: int, verbose: bool = False) -> None:
     if example_index < 0 or example_index >= len(EXAMPLE_REQUIREMENTS):
-        print(f"[ERROR] Invalid example index. Choose 0-{len(EXAMPLE_REQUIREMENTS)-1}")
+        print(
+            f"[ERROR] Invalid example index. "
+            f"Choose 0-{len(EXAMPLE_REQUIREMENTS) - 1}"
+        )
         return
-    
     requirement = EXAMPLE_REQUIREMENTS[example_index]
-    print(f"\n[EXAMPLE] Running Example {example_index + 1}:")
-    print(f"   {requirement}\n")
-    
-    run_agent(requirement, verbose=True)
+    print(f"\n[EXAMPLE] Running Example {example_index + 1}:\n   {requirement}\n")
+    run_agent(requirement, verbose=verbose, exit_on_finish=False)
 
 
-# ========== ENTRY POINT ==========
-if __name__ == "__main__":
-    import argparse
-    
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="AI Dev Agent - Autonomous Software Development Agent",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python main.py                                    # Interactive mode
-  python main.py --requirement "Create a Flask app" # Single requirement
-  python main.py --example 0                        # Run predefined example
-  python main.py --list-examples                    # Show all examples
-        """
+        epilog=textwrap.dedent("""
+            Examples:
+              python main.py                                            # Interactive
+              python main.py --requirement "Create a Flask app"         # One-shot
+              python main.py --requirement "..." --verbose              # Full trace
+              python main.py --requirement "..." --ci                   # Exit code for CI
+              python main.py --example 0                                # Predefined
+              python main.py --list-examples                            # List examples
+
+            Exit codes (with --ci):
+              0  SUCCESS — all steps completed and verified
+              2  FAILED  — execution finished but reported failure
+              3  INCOMPLETE — graph terminated without final_status
+              130 Interrupted by user (Ctrl+C)
+        """),
     )
-    
-    parser.add_argument(
-        "--requirement", "-r",
-        type=str,
-        help="Single requirement to execute (non-interactive)"
-    )
-    
-    parser.add_argument(
-        "--example", "-e",
-        type=int,
-        help="Run predefined example by index (0-4)"
-    )
-    
-    parser.add_argument(
-        "--list-examples", "-l",
-        action="store_true",
-        help="List all predefined examples"
-    )
-    
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        default=True,
-        help="Print detailed execution logs"
-    )
-    
+
+    parser.add_argument("--requirement", "-r", type=str,
+                        help="Single requirement to execute (non-interactive)")
+    parser.add_argument("--example", "-e", type=int,
+                        help=f"Run predefined example (0-{len(EXAMPLE_REQUIREMENTS)-1})")
+    parser.add_argument("--list-examples", "-l", action="store_true",
+                        help="List all predefined examples and exit")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Print the full execution log")
+    parser.add_argument("--quiet", "-q", action="store_true",
+                        help="Suppress per-line trace (default)")
+    parser.add_argument("--ci", action="store_true",
+                        help="Exit with status-derived code (for CI pipelines)")
+
     args = parser.parse_args()
-    
-    # Handle different modes
+
     if args.list_examples:
         print("\n[EXAMPLES] Predefined Examples:")
         for i, req in enumerate(EXAMPLE_REQUIREMENTS):
             print(f"  {i}. {req}")
-    
-    elif args.example is not None:
-        run_example(args.example)
-    
-    elif args.requirement:
-        run_agent(args.requirement, verbose=args.verbose)
-    
-    else:
-        # Interactive mode
-        main()
+        return
+
+    verbose = args.verbose and not args.quiet
+
+    if args.example is not None:
+        run_example(args.example, verbose=verbose)
+        return
+
+    if args.requirement:
+        run_agent(
+            args.requirement,
+            verbose=verbose,
+            exit_on_finish=args.ci,
+        )
+        return
+
+    main_interactive()
+
+
+if __name__ == "__main__":
+    main()

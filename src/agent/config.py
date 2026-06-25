@@ -1,21 +1,17 @@
 import os
 from dotenv import load_dotenv
-from langchain_mistralai import ChatMistralAI
+from langchain_ollama import ChatOllama
 
-# Load variables from .env
 load_dotenv()
 
-def initialise_llm():
-    """Initializes and returns the Mistral LLM."""
-    if not os.getenv("MISTRAL_API_KEY"):
-        raise EnvironmentError(
-            "CRITICAL: MISTRAL_API_KEY not found in .env file."
-        )
-        
-    return ChatMistralAI(
-        model="mistral-large-latest",
-        temperature=0.0
+
+
+def initialise_llm() -> ChatOllama:
+    return ChatOllama(
+        model=os.getenv("OLLAMA_MODEL", "gemma4:31b-cloud"),
+        temperature=float(os.getenv("OLLAMA_TEMPERATURE", "0")),
+        base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
     )
 
-# Usage
+
 llm = initialise_llm()

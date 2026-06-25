@@ -4,7 +4,7 @@ from langchain_core.messages import HumanMessage
 
 def test_connection():
     try:
-        print("Connecting to Mistral...")
+        print("Connecting to local Ollama Qwen model...")
         response = llm.invoke([HumanMessage(content="Hello! If you can read this, your connection is successful.")])
         print("\nSuccess! LLM Response:")
         print(response.content)
