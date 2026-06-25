@@ -412,6 +412,9 @@ def _invoke_llm(error_analysis: Dict, code_context: str, file_path: str) -> Dict
         return extract_json_object(text) or {}
     except ValueError:
         return {}
+    
+
+    
 
 def _validate_fix_plan(raw: Dict, fallback: FixPlan) -> FixPlan:
     if not isinstance(raw, dict) or "fixes" not in raw:
