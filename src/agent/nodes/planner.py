@@ -45,7 +45,9 @@ VALID_PROJECT_TYPES = {"script", "utility", "application", "compiled", "unknown"
 KNOWN_LANGUAGES = {
     "python", "javascript", "typescript", "cpp", "c", "rust", "go",
     "java", "csharp", "ruby", "php", "swift", "kotlin", "scala",
-    "haskell", "elixir", "lua", "r", "julia", "dart", "shell", "unknown",
+    "haskell", "elixir", "lua", "r", "julia", "dart", "shell",
+    "html", "css", "sql", "yaml", "json", "markdown",
+    "unknown",
 }
 
 # Languages that need compilation
@@ -96,6 +98,8 @@ D. COMPILED LANGUAGE PROGRAM
    → ONE source file, compile + run
    → project_type: "compiled"
 
+
+
 NEVER inflate a Type A problem into a Type C plan. If the requirement fits
 in one file with stdlib only, the plan is SMALL.
 
@@ -122,6 +126,13 @@ HARD RULES
    absolute, never use ".." or drive letters.
 
 7. Use `python -m uvicorn ...` to launch FastAPI/Starlette apps.
+
+8.HTML/CSS/STATIC FILES:
+   - HTML, CSS, JSON, YAML, Markdown files = project_type "script"
+   - needs_server=false, needs_compilation=false, needs_dependencies=false
+   - Verification step: just confirm files were created with valid content
+   - DO NOT run `python -m http.server` for verification — files existing is enough
+   - Example: "Create index.html with student form, create styles.css with form styling"
 
 ═══════════════════════════════════════════════════════════════════════
 OUTPUT FORMAT (JSON only — first char `{`, last char `}`)
