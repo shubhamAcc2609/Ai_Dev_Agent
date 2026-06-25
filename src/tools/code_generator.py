@@ -160,6 +160,12 @@ FORBIDDEN:
 - Duplicate files like app_new.py, main_v2.py, final_final.py.
 - Empty strings; use null for unused fields.
 - Markdown fences or explanations outside the JSON object.
+- Never use redirection: `>`, `>>`, `<`, `2>&1`
+- Never use background process tricks: `&`, `nohup`, `disown`
+- Never use stdin piping for input: `echo X | prog`, `prog <<EOF`
+- If verification needs more than what an exit code provides,
+  describe the verification in the description field instead of
+  trying to capture output via shell tricks.
 
 Always populate `operation`, `verification`, and `description` with non-empty
 strings. NEVER leave `file_content` as an empty string or placeholder for
