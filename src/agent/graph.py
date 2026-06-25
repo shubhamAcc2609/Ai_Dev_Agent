@@ -4,9 +4,17 @@ Agent Graph - LangGraph Workflow Orchestration
 Defines the complete AI Dev Agent workflow:
 1. Planner   → generates plan steps + classification metadata
 2. Router    → reads classification, picks the right executor branch
-3. Executor  → orchestrates Code Generator, File Manager, Execution Manager
+3. Executors → THREE specialized executors handle different project types:
+                - SimpleExecutor    (Python scripts, basic CLI tools)
+                - CompiledExecutor  (C, C++, Rust, Go, Java)
+                - WebExecutor       (FastAPI, Flask, Streamlit)
 4. Conditional routing → continue until complete or replanning needed
 5. Error recovery → with integrated Error Analyzer and Fix Generator
+
+Day 2 changes from Day 1:
+- Three executor nodes instead of one monolithic node
+- Router's conditional edges now point to three distinct executors
+- Each executor independently routes back via should_continue
 """
 
 from langgraph.graph import StateGraph, END
@@ -19,65 +27,71 @@ from src.agent.nodes.router import (
     ROUTE_COMPILED,
     ROUTE_WEB,
 )
-from src.agent.nodes.executor import executor_node
+from src.agent.nodes.simple_executor import simple_executor_node
+from src.agent.nodes.compiled_executor import compiled_executor_node
+from src.agent.nodes.web_executor import web_executor_node
 
 
 # ---------------------------------------------------------------------------
-# Routing functions (conditional edges)
+# Node name constants — keep in sync with workflow.add_node calls
+# ---------------------------------------------------------------------------
+
+NODE_PLANNER = "planner"
+NODE_ROUTER = "router"
+NODE_SIMPLE_EXEC = "simple_executor"
+NODE_COMPILED_EXEC = "compiled_executor"
+NODE_WEB_EXEC = "web_executor"
+
+# Maps Router output strings to actual node names in the graph.
+# This decoupling means renaming a route doesn't require touching every edge.
+ROUTE_TO_NODE = {
+    ROUTE_SIMPLE:   NODE_SIMPLE_EXEC,
+    ROUTE_COMPILED: NODE_COMPILED_EXEC,
+    ROUTE_WEB:      NODE_WEB_EXEC,
+}
+
+
+# ---------------------------------------------------------------------------
+# Conditional edge functions
 # ---------------------------------------------------------------------------
 
 def route_to_executor(state: AgentState) -> str:
     """
     Conditional edge from Router → which executor handles this task.
 
-    The Router has already populated `state["route"]` based on the Planner's
-    classification metadata. This function just translates the route string
-    into the next graph node name.
-
-    DAY 1 NOTE: All three routes currently map to the same "executor" node
-    because the executor split hasn't happened yet. On Day 2 this map will
-    point to "simple_executor" / "compiled_executor" / "web_executor".
-
-    Returns:
-        str: Name of the next graph node to invoke.
+    Router has already populated state["route"]. We translate that into
+    a node name. If somehow the route is missing or unknown, fall back to
+    the simple executor (safest default — it handles the broadest range).
     """
     route = state.get("route", ROUTE_SIMPLE)
-
-    # Day 1: all three routes go to the existing executor.
-    # The architecture is visible (3 routes!) but behavior is unchanged.
-    # On Day 2, change this map to the three specialized executors.
-    return {
-        ROUTE_SIMPLE:   "executor",
-        ROUTE_COMPILED: "executor",
-        ROUTE_WEB:      "executor",
-    }.get(route, "executor")  # Safe default — always returns a valid node
+    return ROUTE_TO_NODE.get(route, NODE_SIMPLE_EXEC)
 
 
 def should_continue(state: AgentState) -> str:
     """
-    Conditional edge from Executor → where to go next.
+    Conditional edge from any Executor → where to go next.
 
     Routing logic:
-      - is_complete=True → END
-      - plan_feedback set → back to Planner for replanning
-      - otherwise → re-enter executor for the next step
+      - is_complete=True       → END (terminal)
+      - plan_feedback set      → planner (replan after max retries)
+      - otherwise              → re-enter the SAME executor for next step
 
-    Args:
-        state: Current agent state
-
-    Returns:
-        str: Next node name ("executor", "planner", or END)
+    Why "same executor": once the Router has classified a project, all
+    subsequent steps stay in the same specialized executor. We don't
+    re-route mid-execution. This is determined by reading the route from
+    state and returning the corresponding executor node name.
     """
-    # If agent marked complete, terminate
+    # Terminal: all done
     if state.get("is_complete", False):
         return END
 
-    # If planner feedback is set, replan (executor exhausted retries)
+    # Escalation: planner needs to replan after executor exhausted retries
     if state.get("plan_feedback"):
-        return "planner"
+        return NODE_PLANNER
 
-    # Otherwise, keep executing — executor manages step progression internally
-    return "executor"
+    # Continue: same executor handles the next step
+    route = state.get("route", ROUTE_SIMPLE)
+    return ROUTE_TO_NODE.get(route, NODE_SIMPLE_EXEC)
 
 
 # ---------------------------------------------------------------------------
@@ -88,13 +102,14 @@ def create_workflow() -> "StateGraph":
     """
     Build, configure, and compile the LangGraph workflow.
 
-    Architecture (Day 1):
-        Planner → Router → Executor ⟲ (with replan loop back to Planner)
+    Final architecture (Day 2 complete):
 
-    Architecture (Day 2 target):
-        Planner → Router → ┬─→ SimpleExecutor   ─┐
-                            ├─→ CompiledExecutor ─┼─→ END (or replan)
-                            └─→ WebExecutor      ─┘
+        Planner → Router ─┬─→ SimpleExecutor   ─┐
+                          ├─→ CompiledExecutor ─┼─→ (retry / replan / END)
+                          └─→ WebExecutor      ─┘
+
+    Each executor loops back to itself for the next step until done.
+    On replan, control returns to the Planner for a fresh plan.
 
     Returns:
         CompiledGraph: Ready-to-use workflow graph
@@ -105,48 +120,54 @@ def create_workflow() -> "StateGraph":
 
     # ========== ADD NODES ==========
     print("Adding nodes to graph...")
-    workflow.add_node("planner", planner_node)
-    workflow.add_node("router", router_node)
-    workflow.add_node("executor", executor_node)
-    print("[+] Added nodes: planner, router, executor")
+    workflow.add_node(NODE_PLANNER, planner_node)
+    workflow.add_node(NODE_ROUTER, router_node)
+    workflow.add_node(NODE_SIMPLE_EXEC, simple_executor_node)
+    workflow.add_node(NODE_COMPILED_EXEC, compiled_executor_node)
+    workflow.add_node(NODE_WEB_EXEC, web_executor_node)
+    print("[+] Added nodes: planner, router, simple_executor, "
+          "compiled_executor, web_executor")
 
     # ========== ADD EDGES ==========
     print("Configuring edges and routing...")
 
     # Entry point: always start with planner
-    workflow.set_entry_point("planner")
+    workflow.set_entry_point(NODE_PLANNER)
 
     # Planner → Router (Router reads classification metadata from state)
-    workflow.add_edge("planner", "router")
+    workflow.add_edge(NODE_PLANNER, NODE_ROUTER)
 
-    # Router → Executor (conditional based on route value)
+    # Router → one of three executors (conditional based on route value)
     workflow.add_conditional_edges(
-        "router",
+        NODE_ROUTER,
         route_to_executor,
         {
-            "executor": "executor",
-            # Day 2 target (uncomment when executors are split):
-            # "simple_executor":   "simple_executor",
-            # "compiled_executor": "compiled_executor",
-            # "web_executor":      "web_executor",
+            NODE_SIMPLE_EXEC:   NODE_SIMPLE_EXEC,
+            NODE_COMPILED_EXEC: NODE_COMPILED_EXEC,
+            NODE_WEB_EXEC:      NODE_WEB_EXEC,
         },
     )
 
-    # Executor → conditional routing (retry, replan, or end)
-    workflow.add_conditional_edges(
-        "executor",
-        should_continue,
-        {
-            "executor": "executor",  # Retry / next step
-            "planner":  "planner",   # Replan (after max retries)
-            END:        END,         # All done
-        },
-    )
+    # Each executor has its own conditional routing.
+    # All three share the same `should_continue` function — it reads
+    # state["route"] to figure out which executor to loop back to.
+    for executor_node_name in (NODE_SIMPLE_EXEC, NODE_COMPILED_EXEC, NODE_WEB_EXEC):
+        workflow.add_conditional_edges(
+            executor_node_name,
+            should_continue,
+            {
+                NODE_SIMPLE_EXEC:   NODE_SIMPLE_EXEC,
+                NODE_COMPILED_EXEC: NODE_COMPILED_EXEC,
+                NODE_WEB_EXEC:      NODE_WEB_EXEC,
+                NODE_PLANNER:       NODE_PLANNER,
+                END:                END,
+            },
+        )
 
     print("[+] Routing configured:")
     print("  - Planner -> Router")
-    print("  - Router -> Executor (by route: simple | compiled | web)")
-    print("  - Executor -> Executor (retry) | Planner (replan) | END (complete)")
+    print("  - Router -> SimpleExecutor | CompiledExecutor | WebExecutor")
+    print("  - Each Executor -> Self (next step) | Planner (replan) | END (done)")
 
     # ========== COMPILE GRAPH ==========
     print("Compiling workflow graph...")
@@ -154,14 +175,26 @@ def create_workflow() -> "StateGraph":
     print("[+] Workflow graph compiled successfully!")
 
     print("\nWorkflow Summary:")
-    print("  Start: Planner Node")
-    print("  Planner: Generates plan + classification (project_type, language, etc.)")
-    print("  Router:  Reads classification, picks the right executor branch")
-    print("           Routes: simple | compiled | web")
-    print("  Executor: Runs each step (Code Generator -> File Manager -> Execution Manager)")
-    print("            On failure -> Error Analyzer -> Fix Generator -> Retry")
-    print("            Max retries exceeded -> Feedback to Planner (replan)")
-    print("  End: When all steps complete or user intervention needed")
+    print("  Start:    Planner Node")
+    print("  Planner:  Generates plan + classification metadata")
+    print("            (project_type, language, needs_compilation, needs_server)")
+    print("  Router:   Reads metadata, picks the right executor branch")
+    print("            Routes: simple | compiled | web")
+    print()
+    print("  SimpleExecutor:   Python scripts, basic CLI tools")
+    print("                    Standard 30s timeout, single-command verification")
+    print()
+    print("  CompiledExecutor: C, C++, Rust, Go, Java")
+    print("                    60s compile timeout, missing-compiler detection")
+    print("                    Distinct [compile] vs [run] log phases")
+    print()
+    print("  WebExecutor:      FastAPI, Flask, Streamlit")
+    print("                    180s install timeout, background server launch")
+    print("                    HTTP endpoint probing for real verification")
+    print()
+    print("  All executors:    On failure -> Error Analyzer -> Fix Generator -> Retry")
+    print("                    Max retries exceeded -> Feedback to Planner (replan)")
+    print("  End:              When all steps complete or unrecoverable failure")
 
     return graph
 
@@ -182,16 +215,44 @@ if __name__ == "__main__":
     print("TESTING GRAPH STRUCTURE")
     print("=" * 60)
 
-    # Test: Print graph structure
+    # Test 1: Print graph structure
     print("\nGraph structure:")
     try:
         print(graph)
     except Exception as e:
         print(f"(Graph structure visualization not available: {e})")
 
-    # Test: Create mock state and confirm graph is invokable
+    # Test 2: Verify ROUTE_TO_NODE map is complete
+    print("\nRoute mapping check:")
+    for route, node in ROUTE_TO_NODE.items():
+        print(f"  {route!r:12} → {node}")
+    print(f"\n  Total routes: {len(ROUTE_TO_NODE)}")
+
+    # Test 3: Confirm route_to_executor handles edge cases
+    print("\nrouter_to_executor edge cases:")
+    assert route_to_executor({"route": ROUTE_SIMPLE}) == NODE_SIMPLE_EXEC
+    assert route_to_executor({"route": ROUTE_COMPILED}) == NODE_COMPILED_EXEC
+    assert route_to_executor({"route": ROUTE_WEB}) == NODE_WEB_EXEC
+    assert route_to_executor({"route": "unknown_route"}) == NODE_SIMPLE_EXEC
+    assert route_to_executor({}) == NODE_SIMPLE_EXEC   # no route → default
+    print("  ✓ All known routes map correctly")
+    print("  ✓ Unknown route falls back to simple_executor")
+    print("  ✓ Missing route falls back to simple_executor")
+
+    # Test 4: Confirm should_continue handles all states
+    print("\nshould_continue edge cases:")
+    assert should_continue({"is_complete": True}) == END
+    assert should_continue({"plan_feedback": "needs work"}) == NODE_PLANNER
+    assert should_continue({"route": ROUTE_WEB}) == NODE_WEB_EXEC
+    assert should_continue({"route": ROUTE_COMPILED}) == NODE_COMPILED_EXEC
+    assert should_continue({}) == NODE_SIMPLE_EXEC  # default loop
+    print("  ✓ is_complete=True → END")
+    print("  ✓ plan_feedback set → planner")
+    print("  ✓ Mid-execution → loops back to same executor by route")
+
+    # Test 5: Mock state for graph readiness check
     print("\n" + "-" * 60)
-    print("Testing graph execution with mock requirement")
+    print("Mock state structure (ready for graph.invoke())")
     print("-" * 60)
 
     mock_state = AgentState(
@@ -205,25 +266,28 @@ if __name__ == "__main__":
         retry_count=0,
         plan_feedback=None,
         user_feedback=None,
-        # New fields populated by Planner/Router (defaults shown):
+        # Planner will populate these:
         project_type=None,
         language=None,
         needs_compilation=None,
         needs_server=None,
         needs_dependencies=None,
+        # Router will populate this:
         route=None,
     )
 
     print("\nInitial State:")
-    print(f"  Requirement:       {mock_state['requirement']}")
-    print(f"  Plan:              {mock_state['plan']}")
-    print(f"  Current Step:      {mock_state['current_step']}")
-    print(f"  Is Complete:       {mock_state['is_complete']}")
-    print(f"  Route (pre-router): {mock_state.get('route')}")
+    print(f"  Requirement:        {mock_state['requirement']}")
+    print(f"  Plan:               {mock_state['plan']}")
+    print(f"  Current Step:       {mock_state['current_step']}")
+    print(f"  Is Complete:        {mock_state['is_complete']}")
+    print(f"  Project Type:       {mock_state.get('project_type')} (set by Planner)")
+    print(f"  Route:              {mock_state.get('route')} (set by Router)")
 
-    print("\n(Graph ready for invocation in main.py)")
-    print("  Expected flow on invoke:")
-    print("    1. Planner generates plan + sets project_type='script'")
-    print("    2. Router reads project_type, sets route='simple'")
-    print("    3. Executor runs each step")
-    print("    4. END when complete\n")
+    print("\nExpected flow for this requirement:")
+    print("  1. Planner classifies as 'script', sets project_type='script'")
+    print("  2. Router reads project_type, sets route='simple'")
+    print("  3. simple_executor runs each step")
+    print("  4. END when complete")
+
+    print("\n✓ Graph ready for invocation via main.py")
