@@ -1,12 +1,18 @@
 """
-Fix Generator Module
+Fix Generator
 
-Responsible for:
-- Generating fixes from Error Analyzer output (LLM + deterministic fallback)
-- Safely applying corrective actions (dependency install, file create/update/delete,
-  shell commands) via the existing file_manager / execution_manager modules
-- Verifying fixes by re-running the original failing command
-- Driving an auto-retry loop with loop-detection and escalation hooks
+Generates corrective actions for execution failures and applies them via the
+existing file_manager / execution_manager modules.
+
+Two-stage design:
+    1. Generate — LLM produces a structured fix plan; deterministic fallback
+       handles common cases (missing modules, etc.) when the LLM is unavailable.
+    2. Apply — dispatch each fix to a typed handler with safe argument
+       construction. Dangerous commands and unsafe pip names are rejected
+       before reaching the shell.
+
+Auto-retry loop uses error fingerprinting to detect "no progress" cycles
+and escalates via an optional callback rather than spinning indefinitely.
 """
 
 from __future__ import annotations
@@ -15,11 +21,11 @@ import hashlib
 import logging
 import re
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Tuple
 
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.agent.config import llm
 from src.tools.error_analyzer import analyze_execution_failure
@@ -30,32 +36,42 @@ from src.utils.json_parser import extract_json_object
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Types & constants
+# Configuration
 # ---------------------------------------------------------------------------
+
+MAX_FIXES_PER_PLAN = 10
+DEFAULT_PRIORITY = 5
+DEFAULT_CONFIDENCE = 50
+INSTALL_TIMEOUT_SEC = 120
+
 
 class FixType(str, Enum):
     INSTALL_DEPENDENCY = "install_dependency"
-    MODIFY_FILE        = "modify_file"
-    CREATE_FILE        = "create_file"
-    DELETE_FILE        = "delete_file"
-    RUN_COMMAND        = "run_command"
+    MODIFY_FILE = "modify_file"
+    CREATE_FILE = "create_file"
+    DELETE_FILE = "delete_file"
+    RUN_COMMAND = "run_command"
 
 
-ALLOWED_FIX_TYPES = {ft.value for ft in FixType}
-
-DEFAULT_PRIORITY = 5
-DEFAULT_CONFIDENCE = 50
-MAX_FIXES_PER_PLAN = 10
-
-# Package-name regex (PEP 508-ish) for safe `pip install` arg construction
-PIP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]*(\[[A-Za-z0-9_,\-]+\])?(==[\w\.\-\+]+)?$")
-
-# Tokens we refuse to execute even if the LLM suggests them
-DANGEROUS_TOKENS = (
-    "rm -rf /", "sudo ", "mkfs", "shutdown", "reboot",
-    ":(){:|:&};:", "> /dev/sd", "format c:", "del /f /s /q c:",
+# PEP 508-ish package name with optional version pin and extras.
+# Matches `flask`, `requests==2.31.0`, `uvicorn[standard]`.
+PIP_NAME_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._\-]*"
+    r"(\[[A-Za-z0-9_,\-]+\])?"
+    r"(==[\w\.\-\+]+)?$"
 )
 
+# Patterns we refuse to execute even if the LLM suggests them.
+DANGEROUS_RE = re.compile(
+    r"\b(?:rm\s+-rf\s+/|sudo\s|mkfs|shutdown|reboot|"
+    r"format\s+c:|del\s+/[fsq]+(?:\s+/[fsq]+)*\s+c:\\)",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Fix:
@@ -67,22 +83,25 @@ class Fix:
 
     @classmethod
     def from_dict(cls, data: Dict) -> Optional["Fix"]:
+        """Parse a fix dict from LLM output. Returns None on invalid input."""
         if not isinstance(data, dict):
             return None
+
         fix_type = str(data.get("type", "")).strip()
-        if fix_type not in ALLOWED_FIX_TYPES:
-            logger.warning("Skipping fix with unknown type: %r", fix_type)
+        if fix_type not in {ft.value for ft in FixType}:
             return None
+
         try:
-            priority = int(data.get("priority", DEFAULT_PRIORITY))
+            priority = max(1, min(10, int(data.get("priority", DEFAULT_PRIORITY))))
         except (TypeError, ValueError):
             priority = DEFAULT_PRIORITY
+
         return cls(
             type=fix_type,
             target=str(data.get("target", "")).strip(),
             action=str(data.get("action", "")).strip(),
             content=data.get("content"),
-            priority=max(1, min(10, priority)),
+            priority=priority,
         )
 
 
@@ -95,16 +114,24 @@ class FixPlan:
     confidence: int = DEFAULT_CONFIDENCE
 
     def to_dict(self) -> Dict:
-        d = asdict(self)
-        d["fixes"] = [asdict(f) for f in self.fixes]
-        return d
+        return {
+            "fixes": [
+                {"type": f.type, "target": f.target, "action": f.action,
+                 "content": f.content, "priority": f.priority}
+                for f in self.fixes
+            ],
+            "verification_command": self.verification_command,
+            "rollback_steps": self.rollback_steps,
+            "explanation": self.explanation,
+            "confidence": self.confidence,
+        }
 
 
 # ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
 
-FIX_GENERATOR_SYSTEM_PROMPT = """\
+SYSTEM_PROMPT = """\
 You are an expert fix generator for an autonomous Software Development Agent.
 
 Generate fixes for execution failures. Respond with ONLY one JSON object — no
@@ -127,11 +154,11 @@ Schema:
   "confidence": <integer 0-100>
 }
 
-RULES:
-- File paths MUST be project-relative (no "..", no leading "/", no drive letters).
-- For modify_file / create_file you MUST return the COMPLETE file content.
-- For install_dependency, "target" is the bare package name (e.g. "flask",
-  "requests==2.31.0"). Do NOT include "pip install" in target.
+Rules:
+- File paths must be project-relative (no "..", no leading "/", no drive letters).
+- For modify_file / create_file, content must be the COMPLETE file body.
+- For install_dependency, target is the bare package name (e.g. "flask",
+  "requests==2.31.0"). Do not include "pip install" in target.
 - run_command is for builds, tests, git, or installs that aren't single packages.
 - Never use sudo, rm -rf /, or other destructive shell tricks.
 """
@@ -156,15 +183,14 @@ def generate_fixes(
         error_analysis.get("severity"),
     )
 
-    fallback = _generate_fallback_fixes(error_analysis, file_path)
+    fallback = _build_fallback_plan(error_analysis)
 
-    try:
-        llm_plan_raw = _invoke_llm(error_analysis, code_context, file_path)
-    except Exception as exc:
-        logger.warning("LLM fix generation failed (%s); using fallback", exc)
+    llm_plan = _call_llm(error_analysis, code_context, file_path)
+    if llm_plan is None:
+        logger.info("LLM unavailable; using deterministic fallback")
         return fallback.to_dict()
 
-    plan = _validate_fix_plan(llm_plan_raw, fallback)
+    plan = _merge_with_fallback(llm_plan, fallback)
     logger.info(
         "Fix plan ready: %d fix(es), confidence=%d%%",
         len(plan.fixes), plan.confidence,
@@ -179,40 +205,28 @@ def apply_fixes(
     """
     Apply fixes in priority order.
 
-    Args:
-        fix_plan: Dict returned by `generate_fixes`.
-        dry_run: If True, log what would happen but don't touch disk/exec.
-
     Returns:
         (overall_success, applied_descriptions, error_descriptions)
     """
-    raw_fixes = fix_plan.get("fixes", []) if isinstance(fix_plan, dict) else []
-    fixes = [Fix.from_dict(f) for f in raw_fixes]
-    fixes = [f for f in fixes if f is not None]
-    fixes.sort(key=lambda f: f.priority, reverse=True)
+    fixes = _parse_fix_list(fix_plan)
+    if not fixes:
+        return False, [], ["No valid fixes in plan"]
 
-    logger.info("Applying %d fix(es)%s", len(fixes), " [dry-run]" if dry_run else "")
+    logger.info("Applying %d fix(es)%s",
+                len(fixes), " [dry-run]" if dry_run else "")
 
     applied: List[str] = []
     errors: List[str] = []
 
     for i, fix in enumerate(fixes, 1):
-        logger.info("Fix %d/%d: type=%s target=%r", i, len(fixes), fix.type, fix.target)
-        try:
-            ok, msg = _dispatch_fix(fix, dry_run=dry_run)
-        except Exception as exc:  # last-resort guard
-            logger.exception("Unhandled error applying fix")
-            errors.append(f"{fix.type}({fix.target}) raised: {exc}")
-            continue
+        logger.info("Fix %d/%d: type=%s target=%r",
+                    i, len(fixes), fix.type, fix.target)
+        ok, message = _dispatch(fix, dry_run)
+        (applied if ok else errors).append(message)
 
-        if ok:
-            applied.append(msg)
-        else:
-            errors.append(msg)
-
-    overall = len(errors) == 0 and len(applied) > 0
+    success = bool(applied) and not errors
     logger.info("Apply summary: %d ok, %d failed", len(applied), len(errors))
-    return overall, applied, errors
+    return success, applied, errors
 
 
 def verify_fix(
@@ -220,25 +234,18 @@ def verify_fix(
     original_command: str,
 ) -> Tuple[bool, str]:
     """
-    Verify a fix.
+    Confirm the fix worked.
 
-    Strategy:
-    1. Run the verification command first (cheap, specific signal).
-    2. If it passes (or none given), re-run the original failing command.
+    Runs the verification command first (cheap, targeted signal). Falls back
+    to re-running the original failing command.
     """
     if verification_command:
-        logger.info("Running verification: %r", verification_command)
         ok, stdout, stderr = execute_command(verification_command)
         if not ok:
-            logger.info("Verification command failed")
             return False, stderr or stdout
 
-    logger.info("Re-running original command: %r", original_command)
     ok, stdout, stderr = execute_command(original_command)
-    if ok:
-        logger.info("Original command now succeeds")
-        return True, stdout
-    return False, stderr or stdout
+    return ok, stdout if ok else (stderr or stdout)
 
 
 def auto_fix_and_retry(
@@ -251,144 +258,69 @@ def auto_fix_and_retry(
     """
     Run a command and auto-fix failures up to `max_retries` times.
 
-    Includes:
-    - Loop detection: same error fingerprint twice in a row → give up.
-    - Escalation hook: callback fired when fix is impossible.
+    Loop detection: if the same error fingerprint appears twice consecutively,
+    we give up rather than spin. Escalation callback fires on terminal cases.
     """
-    logger.info("auto_fix_and_retry: %r (max_retries=%d)", command, max_retries)
-
-    fix_history: List[Dict] = []
-    seen_fingerprints: List[str] = []
+    history: List[Dict] = []
+    last_fingerprint = ""
     last_stdout = last_stderr = ""
 
     for attempt in range(1, max_retries + 1):
         logger.info("Attempt %d/%d", attempt, max_retries)
         success, last_stdout, last_stderr = execute_command(command)
         if success:
-            logger.info("Command succeeded on attempt %d", attempt)
-            return True, last_stdout, last_stderr, fix_history
+            return True, last_stdout, last_stderr, history
 
-        error_analysis = analyze_execution_failure(last_stdout, last_stderr, command)
-        fingerprint = _fingerprint_error(error_analysis)
+        analysis = analyze_execution_failure(last_stdout, last_stderr, command)
+        fingerprint = _fingerprint(analysis)
 
-        # Loop detection: same root cause twice → no progress
-        if seen_fingerprints and seen_fingerprints[-1] == fingerprint:
-            logger.warning("Same error fingerprint as previous attempt — aborting")
-            _maybe_escalate(on_escalation, error_analysis, fix_history,
-                            reason="no_progress")
-            return False, last_stdout, last_stderr, fix_history
-        seen_fingerprints.append(fingerprint)
+        if fingerprint == last_fingerprint:
+            logger.warning("No progress — same error twice; escalating")
+            _escalate(on_escalation, analysis, history, "no_progress")
+            return False, last_stdout, last_stderr, history
 
-        if not error_analysis.get("is_recoverable", False):
+        if not analysis.get("is_recoverable", False):
             logger.info("Error marked non-recoverable; escalating")
-            _maybe_escalate(on_escalation, error_analysis, fix_history,
-                            reason="non_recoverable")
-            return False, last_stdout, last_stderr, fix_history
+            _escalate(on_escalation, analysis, history, "non_recoverable")
+            return False, last_stdout, last_stderr, history
 
-        try:
-            fix_plan = generate_fixes(error_analysis, code_context, file_path)
-        except Exception as exc:
-            logger.error("Fix generation failed: %s", exc)
-            return False, last_stdout, last_stderr, fix_history
+        plan = generate_fixes(analysis, code_context, file_path)
+        ok, applied, errors = apply_fixes(plan)
 
-        apply_success, applied, errors = apply_fixes(fix_plan)
-        fix_history.append({
+        history.append({
             "attempt": attempt,
-            "error_analysis": error_analysis,
-            "fix_plan": fix_plan,
+            "error_analysis": analysis,
+            "fix_plan": plan,
             "applied": applied,
             "errors": errors,
             "fingerprint": fingerprint,
         })
 
-        if not apply_success:
-            logger.error("Applying fixes failed: %s", errors)
-            _maybe_escalate(on_escalation, error_analysis, fix_history,
-                            reason="apply_failed")
-            return False, last_stdout, last_stderr, fix_history
+        if not ok:
+            _escalate(on_escalation, analysis, history, "apply_failed")
+            return False, last_stdout, last_stderr, history
 
-    logger.warning("Exceeded max_retries=%d", max_retries)
-    _maybe_escalate(on_escalation, fix_history[-1]["error_analysis"] if fix_history else {},
-                    fix_history, reason="max_retries")
-    return False, last_stdout, last_stderr, fix_history
+        last_fingerprint = fingerprint
 
-
-# ---------------------------------------------------------------------------
-# Dispatcher
-# ---------------------------------------------------------------------------
-
-def _dispatch_fix(fix: Fix, dry_run: bool) -> Tuple[bool, str]:
-    """Route a single fix to the correct handler. Returns (ok, message)."""
-    if fix.type == FixType.INSTALL_DEPENDENCY.value:
-        return _apply_install_dependency(fix, dry_run)
-    if fix.type == FixType.MODIFY_FILE.value:
-        return _apply_write_file(fix, dry_run, op="modify")
-    if fix.type == FixType.CREATE_FILE.value:
-        return _apply_write_file(fix, dry_run, op="create")
-    if fix.type == FixType.DELETE_FILE.value:
-        return _apply_delete_file(fix, dry_run)
-    if fix.type == FixType.RUN_COMMAND.value:
-        return _apply_run_command(fix, dry_run)
-    return False, f"Unknown fix type: {fix.type}"
-
-
-def _apply_install_dependency(fix: Fix, dry_run: bool) -> Tuple[bool, str]:
-    pkg = fix.target.strip()
-    if not pkg:
-        return False, "install_dependency requires a non-empty target"
-    if not PIP_NAME_RE.match(pkg):
-        return False, f"Unsafe pip package spec rejected: {pkg!r}"
-    cmd = f"{_python_exe()} -m pip install {pkg}"
-    if dry_run:
-        return True, f"[dry-run] would run: {cmd}"
-    ok, _, stderr = execute_command(cmd, timeout=120)
-    return ok, (f"Installed dependency: {pkg}" if ok
-                else f"Failed to install {pkg}: {stderr.strip()[:200]}")
-
-
-def _apply_write_file(fix: Fix, dry_run: bool, op: str) -> Tuple[bool, str]:
-    if not fix.target:
-        return False, f"{op}_file requires a target path"
-    if fix.content is None or not isinstance(fix.content, str):
-        return False, f"{op}_file requires string content"
-    if dry_run:
-        return True, f"[dry-run] would {op} file: {fix.target} ({len(fix.content)} chars)"
-    ok, err, files = create_or_update_file(fix.target, fix.content)
-    return ok, (f"{op.title()}d file: {files[0] if files else fix.target}" if ok
-                else f"Failed to {op} {fix.target}: {err}")
-
-
-def _apply_delete_file(fix: Fix, dry_run: bool) -> Tuple[bool, str]:
-    if not fix.target:
-        return False, "delete_file requires a target path"
-    if dry_run:
-        return True, f"[dry-run] would delete: {fix.target}"
-    ok, err = delete_file(fix.target)
-    return ok, (f"Deleted file: {fix.target}" if ok
-                else f"Failed to delete {fix.target}: {err}")
-
-
-def _apply_run_command(fix: Fix, dry_run: bool) -> Tuple[bool, str]:
-    cmd = fix.action or fix.target
-    if not cmd:
-        return False, "run_command requires an action or target"
-    if _is_dangerous(cmd):
-        return False, f"Refused dangerous command: {cmd!r}"
-    if dry_run:
-        return True, f"[dry-run] would run: {cmd}"
-    ok, _, stderr = execute_command(cmd)
-    return ok, (f"Executed: {cmd}" if ok
-                else f"Command failed: {cmd} -- {stderr.strip()[:200]}")
+    logger.warning("Exhausted max_retries=%d", max_retries)
+    final_analysis = history[-1]["error_analysis"] if history else {}
+    _escalate(on_escalation, final_analysis, history, "max_retries")
+    return False, last_stdout, last_stderr, history
 
 
 # ---------------------------------------------------------------------------
-# LLM invocation & validation
+# LLM invocation
 # ---------------------------------------------------------------------------
 
-from langchain_core.messages import HumanMessage, SystemMessage
-
-def _invoke_llm(error_analysis: Dict, code_context: str, file_path: str) -> Dict:
-    """Call the LLM directly with messages — no string templating, no brace bugs."""
+def _call_llm(
+    error_analysis: Dict,
+    code_context: str,
+    file_path: str,
+) -> Optional[Dict]:
+    """
+    Ask the LLM for a fix plan. Returns the parsed JSON object, or None if
+    the LLM call or parsing failed.
+    """
     user_text = (
         "Generate fixes for this error:\n\n"
         f"Error Type: {error_analysis.get('error_type', 'Unknown')}\n"
@@ -396,44 +328,51 @@ def _invoke_llm(error_analysis: Dict, code_context: str, file_path: str) -> Dict
         f"Root Cause: {error_analysis.get('root_cause', '')}\n"
         f"Severity: {error_analysis.get('severity', 'major')}\n"
         f"Affected Component: {error_analysis.get('affected_component', 'Unknown')}\n"
-        f"File Path: {file_path or ''}\n\n"
-        f"Code Context:\n{(code_context or '')[:4000]}\n\n"
+        f"File Path: {file_path}\n\n"
+        f"Code Context:\n{code_context[:4000]}\n\n"
         f"Suggested Fix Direction: {error_analysis.get('suggested_fix', '')}"
     )
 
-    messages = [
-        SystemMessage(content=FIX_GENERATOR_SYSTEM_PROMPT),
-        HumanMessage(content=user_text),
-    ]
-    response = llm.invoke(messages)
-    text = getattr(response, "content", "") or ""
-    logger.debug("LLM fix raw (300 chars): %s", text[:300])
     try:
-        return extract_json_object(text) or {}
-    except ValueError:
-        return {}
-    
+        response = llm.invoke([
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=user_text),
+        ])
+    except Exception as exc:
+        logger.warning("LLM call failed: %s", exc)
+        return None
 
-    
+    text = getattr(response, "content", "") or ""
+    if not text.strip():
+        return None
 
-def _validate_fix_plan(raw: Dict, fallback: FixPlan) -> FixPlan:
-    if not isinstance(raw, dict) or "fixes" not in raw:
-        return fallback
+    try:
+        parsed = extract_json_object(text)
+    except ValueError as exc:
+        logger.warning("Failed to parse LLM fix plan: %s", exc)
+        return None
 
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _merge_with_fallback(raw: Dict, fallback: FixPlan) -> FixPlan:
+    """
+    Build a FixPlan from LLM output, preferring LLM values but falling back
+    to defaults when fields are missing or invalid.
+    """
     raw_fixes = raw.get("fixes") or []
     if not isinstance(raw_fixes, list):
         return fallback
 
-    fixes = [Fix.from_dict(f) for f in raw_fixes[:MAX_FIXES_PER_PLAN]]
-    fixes = [f for f in fixes if f is not None]
+    parsed = [Fix.from_dict(f) for f in raw_fixes[:MAX_FIXES_PER_PLAN]]
+    fixes = [f for f in parsed if f is not None]
     if not fixes:
         return fallback
 
     try:
-        confidence = int(raw.get("confidence", fallback.confidence))
+        confidence = max(0, min(100, int(raw.get("confidence", fallback.confidence))))
     except (TypeError, ValueError):
         confidence = fallback.confidence
-    confidence = max(0, min(100, confidence))
 
     rollback = raw.get("rollback_steps") or fallback.rollback_steps
     if not isinstance(rollback, list):
@@ -441,7 +380,9 @@ def _validate_fix_plan(raw: Dict, fallback: FixPlan) -> FixPlan:
 
     return FixPlan(
         fixes=fixes,
-        verification_command=str(raw.get("verification_command") or fallback.verification_command),
+        verification_command=str(
+            raw.get("verification_command") or fallback.verification_command
+        ),
         rollback_steps=[str(s) for s in rollback],
         explanation=str(raw.get("explanation") or fallback.explanation),
         confidence=confidence,
@@ -449,61 +390,147 @@ def _validate_fix_plan(raw: Dict, fallback: FixPlan) -> FixPlan:
 
 
 # ---------------------------------------------------------------------------
-# Fallback fixes (deterministic, safe defaults)
+# Fix dispatch — each handler validates its own arguments
 # ---------------------------------------------------------------------------
 
-def _generate_fallback_fixes(error_analysis: Dict, file_path: str = "") -> FixPlan:
+def _parse_fix_list(fix_plan: Dict) -> List[Fix]:
+    """Extract and prioritize fixes from a plan dict."""
+    if not isinstance(fix_plan, dict):
+        return []
+    raw_fixes = fix_plan.get("fixes", [])
+    if not isinstance(raw_fixes, list):
+        return []
+    fixes = [Fix.from_dict(f) for f in raw_fixes]
+    fixes = [f for f in fixes if f is not None]
+    fixes.sort(key=lambda f: f.priority, reverse=True)
+    return fixes
+
+
+def _dispatch(fix: Fix, dry_run: bool) -> Tuple[bool, str]:
+    """Route a fix to the right handler. Each handler returns (ok, message)."""
+    handlers = {
+        FixType.INSTALL_DEPENDENCY.value: _install_dependency,
+        FixType.MODIFY_FILE.value: lambda f, d: _write_file(f, d, "modify"),
+        FixType.CREATE_FILE.value: lambda f, d: _write_file(f, d, "create"),
+        FixType.DELETE_FILE.value: _delete_file,
+        FixType.RUN_COMMAND.value: _run_command,
+    }
+    handler = handlers.get(fix.type)
+    if handler is None:
+        return False, f"Unknown fix type: {fix.type}"
+    return handler(fix, dry_run)
+
+
+def _install_dependency(fix: Fix, dry_run: bool) -> Tuple[bool, str]:
+    pkg = fix.target.strip()
+    if not pkg:
+        return False, "install_dependency requires a non-empty target"
+    if not PIP_NAME_RE.match(pkg):
+        return False, f"Unsafe pip package spec rejected: {pkg!r}"
+
+    cmd = f"{_python_exe()} -m pip install {pkg}"
+    if dry_run:
+        return True, f"[dry-run] would run: {cmd}"
+
+    ok, _, stderr = execute_command(cmd, timeout=INSTALL_TIMEOUT_SEC)
+    if ok:
+        return True, f"Installed dependency: {pkg}"
+    return False, f"Failed to install {pkg}: {stderr.strip()[:200]}"
+
+
+def _write_file(fix: Fix, dry_run: bool, verb: str) -> Tuple[bool, str]:
+    if not fix.target:
+        return False, f"{verb}_file requires a target path"
+    if not isinstance(fix.content, str):
+        return False, f"{verb}_file requires string content"
+
+    if dry_run:
+        return True, (
+            f"[dry-run] would {verb} {fix.target} ({len(fix.content)} chars)"
+        )
+
+    ok, err, files = create_or_update_file(fix.target, fix.content)
+    if ok:
+        return True, f"{verb.title()}d file: {files[0] if files else fix.target}"
+    return False, f"Failed to {verb} {fix.target}: {err}"
+
+
+def _delete_file(fix: Fix, dry_run: bool) -> Tuple[bool, str]:
+    if not fix.target:
+        return False, "delete_file requires a target path"
+
+    if dry_run:
+        return True, f"[dry-run] would delete: {fix.target}"
+
+    ok, err = delete_file(fix.target)
+    if ok:
+        return True, f"Deleted file: {fix.target}"
+    return False, f"Failed to delete {fix.target}: {err}"
+
+
+def _run_command(fix: Fix, dry_run: bool) -> Tuple[bool, str]:
+    cmd = fix.action or fix.target
+    if not cmd:
+        return False, "run_command requires an action or target"
+
+    if DANGEROUS_RE.search(cmd):
+        return False, f"Refused dangerous command: {cmd!r}"
+
+    if dry_run:
+        return True, f"[dry-run] would run: {cmd}"
+
+    ok, _, stderr = execute_command(cmd)
+    if ok:
+        return True, f"Executed: {cmd}"
+    return False, f"Command failed: {cmd} -- {stderr.strip()[:200]}"
+
+
+# ---------------------------------------------------------------------------
+# Deterministic fallback
+# ---------------------------------------------------------------------------
+
+def _build_fallback_plan(error_analysis: Dict) -> FixPlan:
+    """
+    Build a deterministic fix plan for common errors without calling the LLM.
+    Used when the LLM is unavailable or its output is unusable.
+    """
     error_type = error_analysis.get("error_type", "UnknownError")
     error_message = error_analysis.get("error_message", "")
-    fixes: List[Fix] = []
-    verification = ""
-    confidence = 30
 
+    # ModuleNotFoundError / ImportError → suggest pip install
     if error_type in ("ModuleNotFoundError", "ImportError"):
         match = re.search(r"No module named ['\"]([^'\"]+)['\"]", error_message)
         if match:
-            module = match.group(1).split(".")[0]  # top-level package
+            module = match.group(1).split(".")[0]
             if PIP_NAME_RE.match(module):
-                fixes.append(Fix(
-                    type=FixType.INSTALL_DEPENDENCY.value,
-                    target=module,
-                    action=f"pip install {module}",
-                    priority=10,
-                ))
-                verification = f'{_python_exe()} -c "import {module}"'
-                confidence = 75
+                return FixPlan(
+                    fixes=[Fix(
+                        type=FixType.INSTALL_DEPENDENCY.value,
+                        target=module,
+                        action=f"pip install {module}",
+                        priority=10,
+                    )],
+                    verification_command=f'{_python_exe()} -c "import {module}"',
+                    rollback_steps=["Uninstall added dependency if needed"],
+                    explanation=f"Install missing module: {module}",
+                    confidence=75,
+                )
 
-    elif error_type == "DependencyError":
-        # Don't blindly retry; ask LLM next round
-        confidence = 15
-
-    elif error_type == "PermissionError":
-        # We deliberately DO NOT auto-chmod arbitrary paths.
-        confidence = 10
-
-    elif error_type in ("SyntaxError", "IndentationError"):
-        # Needs LLM rewrite; fallback can't safely modify the file.
-        confidence = 10
-
-    elif error_type == "PortInUseError":
-        confidence = 20  # Surfacing to LLM is safer than auto-killing processes
-
-    if not fixes:
-        # No safe deterministic action — return empty plan
-        return FixPlan(
-            fixes=[],
-            verification_command=verification,
-            rollback_steps=["No deterministic fallback available"],
-            explanation=f"No safe automatic fallback for {error_type}",
-            confidence=confidence,
-        )
+    # For other error types we don't have safe deterministic actions.
+    # Return an empty plan with low confidence so the LLM (or caller) knows.
+    confidence_by_type = {
+        "DependencyError": 15,
+        "PermissionError": 10,
+        "SyntaxError": 10,
+        "IndentationError": 10,
+        "PortInUseError": 20,
+    }
 
     return FixPlan(
-        fixes=fixes,
-        verification_command=verification,
-        rollback_steps=["Uninstall newly added dependencies if needed"],
-        explanation=f"Fallback fix for {error_type}",
-        confidence=confidence,
+        fixes=[],
+        rollback_steps=["No deterministic fallback available"],
+        explanation=f"No safe automatic fallback for {error_type}",
+        confidence=confidence_by_type.get(error_type, 30),
     )
 
 
@@ -512,92 +539,29 @@ def _generate_fallback_fixes(error_analysis: Dict, file_path: str = "") -> FixPl
 # ---------------------------------------------------------------------------
 
 def _python_exe() -> str:
-    """Return the current Python executable, quoted if needed."""
+    """Return the current Python executable, quoted if it contains spaces."""
     exe = sys.executable or "python"
     return f'"{exe}"' if " " in exe else exe
 
 
-def _is_dangerous(command: str) -> bool:
-    lowered = command.lower()
-    return any(tok in lowered for tok in DANGEROUS_TOKENS)
-
-
-def _fingerprint_error(analysis: Dict) -> str:
-    """Stable hash of (error_type, error_message) for loop detection."""
+def _fingerprint(analysis: Dict) -> str:
+    """Stable short hash of an error for loop detection."""
     raw = f"{analysis.get('error_type', '')}|{analysis.get('error_message', '')}"
     return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
 
 
-def _maybe_escalate(
+def _escalate(
     callback: Optional[Callable[[Dict], None]],
-    error_analysis: Dict,
+    analysis: Dict,
     history: List[Dict],
     reason: str,
 ) -> None:
+    """Fire the escalation callback if one was registered."""
     if callback is None:
-        logger.info("Escalation triggered (reason=%s) — no handler registered", reason)
+        logger.info("Escalation (reason=%s) — no handler registered", reason)
         return
-    try:
-        callback({
-            "reason": reason,
-            "error_analysis": error_analysis,
-            "fix_history": history,
-        })
-    except Exception:
-        logger.exception("Escalation handler raised")
-
-
-# ---------------------------------------------------------------------------
-# Self-test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-
-    print("Testing Fix Generator...\n")
-
-    # Test 1: ModuleNotFoundError
-    print("--- Test 1: ModuleNotFoundError ---")
-    err1 = {
-        "error_type": "ModuleNotFoundError",
-        "error_message": "No module named 'flask'",
-        "root_cause": "Flask is not installed",
-        "affected_component": "app.py:1",
-        "severity": "major",
-        "context": "import flask",
-        "suggested_fix": "Install Flask",
-        "is_recoverable": True,
-    }
-    plan1 = generate_fixes(err1)
-    print(f"  fixes: {len(plan1['fixes'])}, confidence: {plan1['confidence']}%")
-    ok, applied, errors = apply_fixes(plan1, dry_run=True)
-    print(f"  dry-run ok={ok}, applied={applied}, errors={errors}\n")
-
-    # Test 2: SyntaxError (no safe deterministic fallback)
-    print("--- Test 2: SyntaxError ---")
-    err2 = {
-        "error_type": "SyntaxError",
-        "error_message": "invalid syntax",
-        "root_cause": "Incorrect Python syntax",
-        "affected_component": "main.py:5",
-        "severity": "critical",
-        "suggested_fix": "Fix syntax",
-        "is_recoverable": True,
-    }
-    plan2 = generate_fixes(err2, code_context="if x = 5\n    pass", file_path="main.py")
-    print(f"  fixes: {len(plan2['fixes'])}, confidence: {plan2['confidence']}%")
-    print(f"  explanation: {plan2['explanation']}\n")
-
-    # Test 3: Dangerous command rejection
-    print("--- Test 3: Dangerous command rejection ---")
-    bad_plan = {
-        "fixes": [{"type": "run_command", "target": "danger",
-                   "action": "sudo rm -rf /", "priority": 10}],
-        "verification_command": "", "rollback_steps": [],
-        "explanation": "", "confidence": 90,
-    }
-    ok, applied, errors = apply_fixes(bad_plan, dry_run=False)
-    print(f"  ok={ok}, applied={applied}, errors={errors}")
+    callback({
+        "reason": reason,
+        "error_analysis": analysis,
+        "fix_history": history,
+    })

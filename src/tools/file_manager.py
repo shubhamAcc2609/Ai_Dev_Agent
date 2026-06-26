@@ -1,12 +1,13 @@
 """
-File Manager Module
+File Manager
 
-Responsible for:
-- Creating directories and writing files safely inside a workspace
-- Tracking files created/modified during the session
-- Strict path traversal & symlink protection
-- Atomic writes with rollback on failure
-- Optional size limits and read/delete helpers
+Safe file I/O for the agent's workspace. Handles:
+- Path validation (no traversal, no absolute paths, no reserved names)
+- Atomic writes via tempfile + rename
+- Size limits
+- Thread-safe tracking of files written this session
+
+All paths are project-relative. The workspace is the agent's sandbox.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import os
 import re
 import tempfile
 import threading
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath
 from typing import List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -27,124 +28,97 @@ logger = logging.getLogger(__name__)
 
 WORKSPACE_ROOT = Path("generated_projects/current_project")
 
-MAX_FILE_BYTES = 5 * 1024 * 1024            # 5 MB hard cap per file
-MAX_PATH_LENGTH = 255                       # POSIX-friendly limit
-EXCLUDED_DIRS = {                           # Skipped during listing
+MAX_FILE_BYTES = 5 * 1024 * 1024   # 5 MB
+MAX_PATH_LENGTH = 255
+
+# Folders to skip when listing — these regenerate themselves and add noise
+EXCLUDED_DIRS = {
     ".git", "__pycache__", "node_modules",
     ".venv", "venv", ".mypy_cache", ".pytest_cache",
     "dist", "build", ".idea", ".vscode",
 }
 
+# Reserved on Windows even as part of a filename (case-insensitive)
 WINDOWS_RESERVED = {
     "con", "prn", "aux", "nul",
     *(f"com{i}" for i in range(1, 10)),
     *(f"lpt{i}" for i in range(1, 10)),
 }
 
-# Thread-safe tracking of files created/modified this session
-_created_files_lock = threading.Lock()
+# Patterns that immediately disqualify a path string
+_DRIVE_LETTER_RE = re.compile(r"^[A-Za-z]:")
+
+# Session tracking — thread-safe because Streamlit can rerender concurrently
+_tracking_lock = threading.Lock()
 _created_files: Set[str] = set()
 
 
 # ---------------------------------------------------------------------------
-# Workspace bootstrap
+# Workspace
 # ---------------------------------------------------------------------------
 
 def ensure_workspace() -> Path:
-    """Create the workspace directory if missing and return its resolved path."""
+    """Create the workspace if missing and return its resolved absolute path."""
     WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
     return WORKSPACE_ROOT.resolve()
-
-
-def get_workspace_root() -> Path:
-    """Public accessor for the resolved workspace root."""
-    return ensure_workspace()
 
 
 # ---------------------------------------------------------------------------
 # Path validation
 # ---------------------------------------------------------------------------
 
-def _validate_relative_path(file_path: str) -> None:
+def _validate_path_string(file_path: str) -> None:
     """
-    Pre-validate the *input* string before any filesystem resolution.
+    Reject obviously-bad input before touching the filesystem.
 
-    Raises:
-        ValueError: if the path is unsafe.
+    Raises ValueError with a descriptive message.
     """
-    if not isinstance(file_path, str):
-        raise ValueError("file_path must be a string")
-
-    if not file_path.strip():
-        raise ValueError("file_path must be non-empty")
+    if not isinstance(file_path, str) or not file_path.strip():
+        raise ValueError("file_path must be a non-empty string")
 
     if len(file_path) > MAX_PATH_LENGTH:
         raise ValueError(f"file_path exceeds {MAX_PATH_LENGTH} chars")
 
     if "\x00" in file_path:
-        raise ValueError("Null byte in file_path")
+        raise ValueError("null byte in file_path")
 
     if "\\" in file_path:
-        raise ValueError(f"Backslashes not allowed in file_path: {file_path!r}")
+        raise ValueError(f"backslashes not allowed: {file_path!r}")
 
     if file_path.startswith(("/", "~")):
-        raise ValueError(f"Path must be project-relative: {file_path!r}")
+        raise ValueError(f"path must be project-relative: {file_path!r}")
 
-    if re.match(r"^[A-Za-z]:", file_path):
-        raise ValueError(f"Windows drive letter not allowed: {file_path!r}")
+    if _DRIVE_LETTER_RE.match(file_path):
+        raise ValueError(f"drive letter not allowed: {file_path!r}")
 
-    posix = PurePosixPath(file_path)
-    if posix.is_absolute():
-        raise ValueError(f"Absolute path not allowed: {file_path!r}")
+    parts = PurePosixPath(file_path).parts
+    if any(part == ".." for part in parts):
+        raise ValueError(f"path traversal detected: {file_path!r}")
 
-    if any(part == ".." for part in posix.parts):
-        raise ValueError(f"Path traversal detected: {file_path!r}")
-
-    win = PureWindowsPath(file_path)
-    if win.is_absolute() or win.drive:
-        raise ValueError(f"Windows absolute path detected: {file_path!r}")
-
-    for part in posix.parts:
+    for part in parts:
         stem = part.split(".")[0].lower()
         if stem in WINDOWS_RESERVED:
-            raise ValueError(
-                f"Reserved Windows filename in path: {file_path!r}"
-            )
+            raise ValueError(f"reserved filename in path: {file_path!r}")
 
 
 def _resolve_inside_workspace(file_path: str) -> Path:
     """
-    Validate and resolve a project-relative path to an absolute path
-    inside the workspace. Raises ValueError on any escape attempt.
+    Validate the input, then resolve to an absolute path that we've
+    confirmed lives inside the workspace.
     """
-    _validate_relative_path(file_path)
+    _validate_path_string(file_path)
     workspace = ensure_workspace()
-
     candidate = (workspace / file_path).resolve()
 
-    # Strict containment check (works on all Python versions)
     try:
         candidate.relative_to(workspace)
     except ValueError:
-        raise ValueError(
-            f"Path escapes workspace after resolution: {file_path!r}"
-        )
+        raise ValueError(f"path escapes workspace: {file_path!r}")
 
-    # Symlink defense: ensure no ancestor up to workspace is a symlink
-    _reject_symlink_ancestors(candidate, workspace)
+    if candidate.is_symlink():
+        raise ValueError(f"symlinked path rejected: {candidate}")
 
     return candidate
-
-
-def _reject_symlink_ancestors(candidate: Path, workspace: Path) -> None:
-    """Walk from candidate up to workspace; reject any symlinked component."""
-    current = candidate
-    while current != workspace:
-        if current.is_symlink():
-            raise ValueError(f"Symlinked path component rejected: {current}")
-        if current.parent == current:
-            break
-        current = current.parent
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +127,11 @@ def _reject_symlink_ancestors(candidate: Path, workspace: Path) -> None:
 
 def _atomic_write(target: Path, content: str) -> None:
     """
-    Write `content` to `target` atomically:
-    write to a temp file in the same directory, fsync, then rename.
+    Write content to a temp file in the same directory, fsync, then rename.
+
+    os.replace is atomic on POSIX and Windows (Python 3.3+), so the file
+    either contains the full new content or the previous version — never
+    a partial write.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -164,18 +141,15 @@ def _atomic_write(target: Path, content: str) -> None:
         dir=str(target.parent),
     )
     tmp = Path(tmp_path)
+
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, target)  # atomic on POSIX & Windows (Py 3.3+)
+        os.replace(tmp, target)
     except Exception:
-        # Best-effort cleanup
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            logger.debug("Failed to clean temp file: %s", tmp, exc_info=True)
+        tmp.unlink(missing_ok=True)
         raise
 
 
@@ -188,24 +162,17 @@ def create_or_update_file(
     file_content: str,
 ) -> Tuple[bool, str, List[str]]:
     """
-    Create or update a file inside the workspace.
+    Write a file inside the workspace.
 
-    Returns:
-        (success, error_message, [relative_path_written])
+    Returns (success, error_message, [relative_path_written]).
+    The error_message is empty on success.
     """
-    logger.info("create_or_update_file: %r (%d chars)",
-                file_path, len(file_content) if file_content else 0)
-
     if not isinstance(file_content, str):
         return False, "file_content must be a string", []
 
     encoded_size = len(file_content.encode("utf-8"))
     if encoded_size > MAX_FILE_BYTES:
-        return (
-            False,
-            f"file_content exceeds {MAX_FILE_BYTES} bytes (got {encoded_size})",
-            [],
-        )
+        return False, f"file exceeds {MAX_FILE_BYTES} bytes (got {encoded_size})", []
 
     try:
         target = _resolve_inside_workspace(file_path)
@@ -213,46 +180,29 @@ def create_or_update_file(
         logger.warning("Rejected path %r: %s", file_path, exc)
         return False, str(exc), []
 
-    # Skip no-op writes
-    if target.exists() and target.is_file():
-        try:
-            if target.read_text(encoding="utf-8") == file_content:
-                rel = _relative(target)
-                logger.info("Unchanged, skipping write: %s", rel)
-                _track(rel)
-                return True, "", [rel]
-        except (OSError, UnicodeDecodeError):
-            # Fall through to overwrite
-            pass
+    # Skip the write if content is already identical — common when the
+    # agent revisits the same step.
+    if target.is_file() and _content_matches(target, file_content):
+        rel = _relative(target)
+        _track(rel)
+        logger.debug("No change for %s; skipping write", rel)
+        return True, "", [rel]
 
     try:
         _atomic_write(target, file_content)
-    except PermissionError as exc:
-        msg = f"Permission denied writing {file_path!r}: {exc}"
-        logger.error(msg)
-        return False, msg, []
-    except OSError as exc:
-        msg = f"OS error writing {file_path!r}: {exc}"
-        logger.error(msg)
-        return False, msg, []
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("Unexpected error writing %r", file_path)
-        return False, f"Unexpected error: {exc}", []
-
-    if not target.exists():
-        msg = f"Write reported success but file missing: {target}"
+    except (PermissionError, OSError) as exc:
+        msg = f"write failed for {file_path!r}: {exc}"
         logger.error(msg)
         return False, msg, []
 
-    size = target.stat().st_size
     rel = _relative(target)
-    logger.info("Wrote %s (%d bytes)", rel, size)
     _track(rel)
+    logger.info("Wrote %s (%d bytes)", rel, encoded_size)
     return True, "", [rel]
 
 
 def verify_file_exists(file_path: str) -> bool:
-    """Return True if the (validated) path exists as a file inside the workspace."""
+    """True if the path exists as a regular file inside the workspace."""
     try:
         target = _resolve_inside_workspace(file_path)
     except ValueError:
@@ -264,8 +214,7 @@ def read_file(file_path: str) -> Tuple[bool, str, str]:
     """
     Read a file from the workspace.
 
-    Returns:
-        (success, content_or_error, relative_path)
+    Returns (success, content_or_error, relative_path).
     """
     try:
         target = _resolve_inside_workspace(file_path)
@@ -273,34 +222,31 @@ def read_file(file_path: str) -> Tuple[bool, str, str]:
         return False, str(exc), ""
 
     if not target.is_file():
-        return False, f"File not found: {file_path}", ""
+        return False, f"file not found: {file_path}", ""
 
     try:
-        content = target.read_text(encoding="utf-8")
-        return True, content, _relative(target)
+        return True, target.read_text(encoding="utf-8"), _relative(target)
     except (OSError, UnicodeDecodeError) as exc:
-        return False, f"Read error: {exc}", ""
+        return False, f"read failed: {exc}", ""
 
 
 def delete_file(file_path: str) -> Tuple[bool, str]:
-    """Delete a file inside the workspace."""
+    """Delete a file inside the workspace. Returns (success, error_message)."""
     try:
         target = _resolve_inside_workspace(file_path)
     except ValueError as exc:
         return False, str(exc)
 
-    if not target.exists():
-        return False, f"File not found: {file_path}"
     if not target.is_file():
-        return False, f"Not a regular file: {file_path}"
+        return False, f"file not found or not regular: {file_path}"
 
     try:
         target.unlink()
     except OSError as exc:
-        return False, f"Delete failed: {exc}"
+        return False, f"delete failed: {exc}"
 
     rel = _relative(target)
-    with _created_files_lock:
+    with _tracking_lock:
         _created_files.discard(rel)
     logger.info("Deleted %s", rel)
     return True, ""
@@ -308,23 +254,21 @@ def delete_file(file_path: str) -> Tuple[bool, str]:
 
 def list_created_files(tracked_only: bool = False) -> List[str]:
     """
-    List files in the workspace, as paths relative to the workspace root.
+    List files in the workspace, as workspace-relative paths.
 
-    Args:
-        tracked_only: If True, return only files written via this module
-                      in the current session.
+    tracked_only=True returns only files written via this module
+    in the current session (useful for "what did the agent produce?").
     """
     if tracked_only:
-        with _created_files_lock:
+        with _tracking_lock:
             return sorted(_created_files)
 
     workspace = ensure_workspace()
     if not workspace.exists():
         return []
 
-    results: List[str] = []
+    results = []
     for path in workspace.rglob("*"):
-        # Skip excluded directories anywhere in the hierarchy
         if any(part in EXCLUDED_DIRS for part in path.parts):
             continue
         if path.is_file():
@@ -333,24 +277,31 @@ def list_created_files(tracked_only: bool = False) -> List[str]:
 
 
 def reset_tracking() -> None:
-    """Clear the in-memory tracker (useful between sessions/tests)."""
-    with _created_files_lock:
+    """Clear the in-memory tracker — useful for tests or between sessions."""
+    with _tracking_lock:
         _created_files.clear()
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _relative(target: Path) -> str:
-    """Return a forward-slash, workspace-relative path string."""
-    workspace = ensure_workspace()
-    return target.relative_to(workspace).as_posix()
+    """Workspace-relative path string with forward slashes."""
+    return target.relative_to(ensure_workspace()).as_posix()
 
 
 def _track(relative_path: str) -> None:
-    with _created_files_lock:
+    with _tracking_lock:
         _created_files.add(relative_path)
+
+
+def _content_matches(target: Path, content: str) -> bool:
+    """True if the file's current content equals `content`."""
+    try:
+        return target.read_text(encoding="utf-8") == content
+    except (OSError, UnicodeDecodeError):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -371,30 +322,23 @@ if __name__ == "__main__":
 
     # Nested path
     ok, err, files = create_or_update_file(
-        "src/utils/helpers.py", "def add(a, b):\n    return a + b\n"
+        "src/utils/helpers.py", "def add(a, b):\n    return a + b\n",
     )
     print(f"create nested  -> ok={ok}, err={err!r}, files={files}")
 
-    # Unchanged write (should be a no-op)
+    # Idempotent rewrite (no-op)
     ok, err, files = create_or_update_file("main.py", "print('hello world')\n")
     print(f"rewrite same   -> ok={ok}, err={err!r}, files={files}")
 
-    # Path traversal attempt
-    ok, err, files = create_or_update_file("../evil.py", "boom")
-    print(f"traversal      -> ok={ok}, err={err!r}")
+    # Rejection cases
+    for bad_path in ("../evil.py", "/etc/passwd", "C:\\Windows\\evil.py"):
+        ok, err, _ = create_or_update_file(bad_path, "boom")
+        print(f"reject {bad_path!r:25} -> ok={ok}, err={err}")
 
-    # Absolute path attempt
-    ok, err, files = create_or_update_file("/etc/passwd", "boom")
-    print(f"absolute       -> ok={ok}, err={err!r}")
-
-    # Windows path attempt
-    ok, err, files = create_or_update_file("C:\\Windows\\evil.py", "boom")
-    print(f"windows abs    -> ok={ok}, err={err!r}")
-
-    # Verify + read
+    # Read back
     print(f"\nexists main.py = {verify_file_exists('main.py')}")
     ok, content, rel = read_file("main.py")
-    print(f"read main.py   -> ok={ok}, content={content!r}, rel={rel}")
+    print(f"read main.py   -> ok={ok}, content={content!r}")
 
     print("\nAll workspace files:")
     for f in list_created_files():
