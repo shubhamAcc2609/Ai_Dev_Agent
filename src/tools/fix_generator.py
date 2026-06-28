@@ -161,6 +161,9 @@ Rules:
   "requests==2.31.0"). Do not include "pip install" in target.
 - run_command is for builds, tests, git, or installs that aren't single packages.
 - Never use sudo, rm -rf /, or other destructive shell tricks.
+-When wrapping risky code in try/except, the except block must PRINT a 
+descriptive message (e.g., "Error: division by zero"). Never use silent 
+`pass` — the user must see what was caught.
 """
 
 

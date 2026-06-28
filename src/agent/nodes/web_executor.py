@@ -8,8 +8,15 @@ with three command modes:
 - regular: standard timeout for tests, scripts, etc.
 
 The HTTP probe is the differentiator from simple/compiled executors — we
-don't just check that the process started, we hit an endpoint and confirm
-it responds. That's real verification, not just exit-code checking.
+don't just check that the process started, we hit the *planned* endpoint
+and confirm it responds correctly. That's real verification.
+
+Day 3 update:
+- The probe now extracts the target endpoint from the planned curl/test
+  command (e.g. `curl http://127.0.0.1:8000/multiply?a=5&b=10`) and probes
+  THAT endpoint, not a hardcoded /docs. This means broken endpoints
+  actually surface as failures and trigger the Error Analyzer → Fix
+  Generator recovery loop.
 """
 
 from __future__ import annotations
@@ -60,10 +67,15 @@ SERVER_DEFAULT_PORT = 8000
 SERVER_STARTUP_WAIT_SEC = 10
 SERVER_PROBE_TIMEOUT_SEC = 3.0
 SERVER_PROBE_INTERVAL_SEC = 0.5
-SERVER_PROBE_PATHS = (
-    "/docs",          # FastAPI Swagger UI — best signal
-    "/health",        # Common health endpoint
-    "/",              # Root fallback
+
+# Fallback probe paths used ONLY when no planned endpoint can be parsed
+# from the command. When the plan contains an explicit curl URL we probe
+# THAT path instead (see _extract_probe_target).
+SERVER_FALLBACK_PROBE_PATHS = (
+    "/docs",
+    "/health",
+    "/",
+    "/ping",
 )
 
 VALID_OPERATIONS = {"create_file", "update_file", "execute_command", "verify"}
@@ -86,6 +98,12 @@ SERVER_PATTERNS = (
     re.compile(r"\bflask\s+run\b", re.IGNORECASE),
     re.compile(r"\bstreamlit\s+run\b", re.IGNORECASE),
     re.compile(r"\bpython\s+-m\s+http\.server\b", re.IGNORECASE),
+)
+
+# Regex to pull a planned target URL out of a command (curl, wget, etc.)
+_PLANNED_URL_RE = re.compile(
+    r"https?://(?:localhost|127\.0\.0\.1)(?::(\d+))?(/[^\s'\"`)]*)?",
+    re.IGNORECASE,
 )
 
 
@@ -344,17 +362,51 @@ def _extract_port(command: str) -> int:
     return SERVER_DEFAULT_PORT
 
 
+def _extract_probe_target(command: str, default_port: int) -> Tuple[Tuple[str, ...], int, bool]:
+    """
+    Parse the planned command for a target URL (e.g. `curl http://127.0.0.1:8000/multiply?a=5&b=10`)
+    and return the probe paths to try plus the port.
+
+    Returns:
+        (paths_to_try, port, planned)
+        - paths_to_try: ordered tuple of paths to probe
+        - port: port discovered (from URL if present, else default_port)
+        - planned: True if we found an explicit endpoint in the command,
+                   False if we're falling back to generic paths
+
+    When `planned=True`, the executor must treat 4xx/5xx as FAILURE because
+    we know exactly what the user wanted hit. When `planned=False`, we keep
+    the lenient routing-fallback behavior (a 4xx on /docs still means the
+    server is up).
+    """
+    if not command:
+        return SERVER_FALLBACK_PROBE_PATHS, default_port, False
+
+    match = _PLANNED_URL_RE.search(command)
+    if not match:
+        return SERVER_FALLBACK_PROBE_PATHS, default_port, False
+
+    port = int(match.group(1)) if match.group(1) else default_port
+    path = match.group(2) or "/"
+    return (path,), port, True
+
+
 def _probe_http_endpoint(
     port: int,
-    paths: Tuple[str, ...] = SERVER_PROBE_PATHS,
+    paths: Tuple[str, ...],
+    strict: bool,
 ) -> Tuple[bool, str, int, str]:
     """
     Try each probe path; return (success, path_used, status_code, body_excerpt).
 
-    Strategy:
-    - 2xx/3xx = real success (app is working)
+    Strategy when strict=False (no planned endpoint):
+    - 2xx/3xx = real success
     - 4xx = accept as routing proof (server is up, just no route at that path)
     - 5xx and network errors = failure
+
+    Strategy when strict=True (planned endpoint from the command):
+    - 2xx/3xx = success
+    - 4xx, 5xx, network errors = failure (we know what should have worked)
     """
     routing_fallback: Optional[Tuple[bool, str, int, str]] = None
 
@@ -366,8 +418,19 @@ def _probe_http_endpoint(
                 body = resp.read(2048).decode("utf-8", errors="replace")
                 if 200 <= resp.status < 400:
                     return True, path, resp.status, body[:300]
-                routing_fallback = (True, path, resp.status, body[:300])
+                # 4xx/5xx on a 200-class response (rare)
+                if not strict and routing_fallback is None:
+                    routing_fallback = (True, path, resp.status, body[:300])
         except urllib.error.HTTPError as exc:
+            # Server is up but returned an error code
+            if strict:
+                # Planned endpoint MUST return success; surface the error
+                try:
+                    body = exc.read(2048).decode("utf-8", errors="replace")
+                except Exception:
+                    body = str(exc.reason)
+                # 5xx = clear failure; 4xx on a planned URL = also failure
+                return False, path, exc.code, body[:300]
             if 400 <= exc.code < 500 and routing_fallback is None:
                 routing_fallback = (True, path, exc.code, str(exc.reason)[:300])
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
@@ -401,13 +464,26 @@ def _run_server_and_probe(
     """
     Background-launch a server, probe its HTTP endpoint, terminate.
 
+    The probe target is extracted from the planned command when possible
+    (e.g. `... && curl http://127.0.0.1:8000/multiply?a=5&b=10`), so we
+    actually validate the endpoint the user asked for — not just /docs.
+
     Returns (success, stdout, stderr, summary).
     """
     workspace = ensure_workspace()
     cmd = normalize_command(command.strip())
-    port = _extract_port(cmd)
 
-    log(f"[server] starting on port {port}...")
+    # Port comes from the server-launch flags; probe target comes from the
+    # planned curl/test URL inside the same command.
+    port = _extract_port(cmd)
+    probe_paths, probe_port, planned = _extract_probe_target(cmd, default_port=port)
+
+    if planned:
+        log(f"[server] starting on port {probe_port}... "
+            f"(planned endpoint: {probe_paths[0]})")
+    else:
+        log(f"[server] starting on port {probe_port}... "
+            f"(no planned endpoint; will probe {list(probe_paths)})")
 
     popen_kwargs = dict(
         shell=True,
@@ -440,13 +516,22 @@ def _run_server_and_probe(
             if proc.poll() is not None:
                 log("[server] process exited before becoming ready")
                 break
-            probe_ok, probe_path, status_code, body = _probe_http_endpoint(port)
+            probe_ok, probe_path, status_code, body = _probe_http_endpoint(
+                probe_port, probe_paths, strict=planned,
+            )
+            # If planned and we got a definitive non-2xx, stop early —
+            # the endpoint is reachable but broken; no point waiting.
             if probe_ok:
+                break
+            if planned and status_code and status_code >= 400:
                 break
             time.sleep(SERVER_PROBE_INTERVAL_SEC)
 
         if probe_ok:
-            summary = f"GET {probe_path} → HTTP {status_code} (body[:80]={body[:80]!r})"
+            summary = (
+                f"GET {probe_path} → HTTP {status_code} "
+                f"(body[:80]={body[:80]!r})"
+            )
             log(f"[server] ✓ endpoint responded: {summary}")
             return True, body, "", summary
 
@@ -456,17 +541,34 @@ def _run_server_and_probe(
         except subprocess.TimeoutExpired:
             out, err = "", ""
 
-        if proc.returncode is not None and proc.returncode != 0:
+        # Decide failure reason
+        if planned and status_code and status_code >= 400:
+            reason = (
+                f"GET {probe_path} → HTTP {status_code} "
+                f"(body[:80]={body[:80]!r})"
+            )
+        elif proc.returncode is not None and proc.returncode != 0:
             reason = "exited_with_error"
         elif proc.returncode is not None:
             reason = "exited_unexpectedly"
         else:
             reason = "no_response_within_timeout"
 
+        # When the endpoint returned a definitive 4xx/5xx, surface the
+        # response body in stderr so the Error Analyzer can read it.
+        stderr_payload = (err or "")[:1500]
+        if planned and status_code and status_code >= 400 and not stderr_payload:
+            stderr_payload = (
+                f"Endpoint {probe_path} returned HTTP {status_code}. "
+                f"Body: {body[:400]}"
+            )
+        if not stderr_payload:
+            stderr_payload = f"No HTTP response on port {probe_port}"
+
         return (
             False,
             (out or "")[:1500],
-            (err or "")[:1500] or f"No HTTP response on port {port}",
+            stderr_payload,
             reason,
         )
 

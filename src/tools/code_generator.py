@@ -101,6 +101,22 @@ OPERATION RULES:
 - execute_command: requires a non-empty command string. file_path and file_content=null.
 - verify: a logical checkpoint. All three of command, file_path, file_content=null.
 
+When the step description includes BOTH a server launch AND a verification 
+curl/test command, combine them into a single command string with `&&` or 
+`;` so the verification URL is preserved. The Web Executor needs the curl 
+URL to know which endpoint to probe.
+
+Example:
+  Bad:  "python -m uvicorn app:app --port 8000"
+  Good: "python -m uvicorn app:app --port 8000 && curl http://127.0.0.1:8000/divide?a=10&b=0"When the step description includes BOTH a server launch AND a verification 
+curl/test command, combine them into a single command string with `&&` or 
+`;` so the verification URL is preserved. The Web Executor needs the curl 
+URL to know which endpoint to probe.
+
+Example:
+  Bad:  "python -m uvicorn app:app --port 8000"
+  Good: "python -m uvicorn app:app --port 8000 && curl http://127.0.0.1:8000/divide?a=10&b=0"
+
 FILE PATH RULES:
 - Project-relative only (e.g. "main.py", "src/app.py").
 - No absolute paths, no "..", no leading "/", no backslashes, no drive letters.

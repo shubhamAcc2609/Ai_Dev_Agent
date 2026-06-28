@@ -286,16 +286,16 @@ def check_all_steps_done(
     If all plan steps have been processed, return the final terminal delta.
     Otherwise return None.
 
-    final_status reflects whether anything errored along the way:
-    - any prior_last_error → "failed"
-    - clean run → "success"
+    final_status reflects whether we finished cleanly:
+    - If we landed here via the normal "all steps done" path → SUCCESS,
+      regardless of how many recovery retries happened along the way.
+    - The replan/escalation path sets `plan_feedback` and routes to the
+      planner instead, so it never reaches this branch.
     """
     if state_basics["current_step"] < len(state_basics["plan"]):
         return None
 
-    status = (
-        STATUS_FAILED if state_basics["prior_last_error"] else STATUS_SUCCESS
-    )
+    status = STATUS_SUCCESS
     log(f"All {len(state_basics['plan'])} steps processed. Status: {status}")
 
     return make_delta(
@@ -304,7 +304,7 @@ def check_all_steps_done(
         is_complete=True,
         current_step=state_basics["current_step"],
         retry_count=0,
-        last_error=state_basics["prior_last_error"],
+        last_error=None,        # ← clear stale error from past retries
         final_status=status,
     )
 
@@ -322,6 +322,12 @@ def build_success_delta(
     """
     After a step succeeds: advance step counter, dedupe files, and decide
     whether to terminate (if last step) or continue.
+
+    A run that reaches this function has — by definition — just succeeded
+    at the current step. If that was the last step, the final_status is
+    SUCCESS regardless of how many earlier recovery attempts happened.
+    The escalation path (plan_feedback) is the only thing that produces
+    a FAILED outcome.
     """
     merged_files = dedupe_preserve_order(
         state_basics["existing_files"] + result.files_created
@@ -339,20 +345,16 @@ def build_success_delta(
     )
 
     if is_done:
-        final_status = (
-            STATUS_SUCCESS if not state_basics["prior_last_error"]
-            else STATUS_FAILED
-        )
-        log(f"All steps complete. final_status={final_status}")
+        log(f"All steps complete. final_status={STATUS_SUCCESS}")
         return make_delta(
             logs=state_basics["existing_logs"] + new_logs,
             files=merged_files,
             current_step=new_step,
             retry_count=0,
-            last_error=state_basics["prior_last_error"],
+            last_error=None,         # ← clear: we recovered, no error stands
             plan_feedback=None,
             is_complete=True,
-            final_status=final_status,
+            final_status=STATUS_SUCCESS,
         )
 
     # Mid-plan success: clear error, advance, continue
@@ -365,7 +367,6 @@ def build_success_delta(
         plan_feedback=None,
         is_complete=False,
     )
-
 
 # ---------------------------------------------------------------------------
 # Failure path — analyze, attempt fix, retry or escalate

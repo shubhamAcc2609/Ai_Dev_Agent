@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # This executor's specific tuning knobs
 # ---------------------------------------------------------------------------
 
-DEFAULT_TIMEOUT = 30        # Most Python scripts finish quickly
+DEFAULT_TIMEOUT = 50       # Most Python scripts finish quickly
 MAX_OUTPUT_PREVIEW = 200    # Chars of stdout/stderr to log on each command
 
 # Operations recognized in code-generator output

@@ -1,223 +1,203 @@
 """
-Router Node
+Orchestrator Agent
 
-Sits between the Planner and the specialized Executors.
+LLM-powered decision node that sits between the Planner and the specialized
+Executors.
 
 Responsibilities:
-- Read the Planner's classification metadata (needs_server, needs_compilation,
-  project_type, language) from state
-- Pick exactly one execution branch: "simple", "compiled", or "web"
-- Emit a clear log line explaining WHY this route was chosen
-- NEVER crash — always return a valid route, even on malformed input
+- Read the user requirement + Planner's classification metadata
+- Use an LLM to reason about which execution branch best fits the task
+- Emit a clear log line explaining WHY this route was chosen (LLM reasoning)
 
 Design philosophy:
-- The Planner is the smart classifier (has LLM context).
-- The Router is pure mechanical logic that respects that classification.
-- No LLM call here — sub-millisecond, fully deterministic, easy to test.
-
-Adding a new route:
-  1. Add the route constant (ROUTE_DATASCIENCE, etc.)
-  2. Add it to VALID_ROUTES
-  3. Add a decision branch in _decide_route()
-  4. Wire the executor in graph.py
+- The Planner extracts structured metadata (project_type, language, flags).
+- The Orchestrator REASONS over that metadata + the raw requirement and
+  decides the execution strategy.
+- Fully agentic: the LLM is the single source of truth for routing.
+  If the LLM call fails, the workflow fails fast and surfaces the error
+  instead of silently degrading.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict
+
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
 
 from src.agent.state import AgentState
+from src.agent.config import llm
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Route constants — keep in sync with graph.py conditional edges
-# ---------------------------------------------------------------------------
 
 ROUTE_SIMPLE = "simple"      # Python scripts, basic CLI tools
 ROUTE_COMPILED = "compiled"  # C, C++, Rust, Go, Java
 ROUTE_WEB = "web"            # FastAPI, Flask, Django
 
-DEFAULT_ROUTE = ROUTE_SIMPLE  # Fall-back for any unclear case
-
 VALID_ROUTES = {ROUTE_SIMPLE, ROUTE_COMPILED, ROUTE_WEB}
 
 
 # ---------------------------------------------------------------------------
-# Public node
+# Structured LLM output schema
 # ---------------------------------------------------------------------------
 
-def router_node(state: AgentState) -> dict:
-    """
-    Inspect the Planner's classification and choose an execution route.
+class OrchestratorDecision(BaseModel):
+    """Schema the LLM must conform to."""
+    executor: str = Field(
+        ...,
+        description="One of: 'simple', 'compiled', 'web'."
+    )
+    reason: str = Field(
+        ...,
+        description="One short sentence explaining the choice."
+    )
+    overrode_planner: bool = Field(
+        default=False,
+        description="True if the orchestrator disagreed with the planner."
+    )
 
-    GUARANTEE: This function never raises. Any exception is caught and
-    the default route is returned with a warning log.
+
+_SYSTEM_PROMPT = """You are the Orchestrator Agent of an autonomous \
+software-development workflow.
+
+Your job: given a user requirement and the Planner's classification, \
+choose exactly ONE execution branch.
+
+Available executors:
+- "simple"   → Python scripts, CLI tools, data utilities (no compile, no server).
+- "compiled" → Languages that must be compiled before running: C, C++, Rust, Go, Java, C#, Swift, Kotlin.
+- "web"      → Anything that starts an HTTP server: FastAPI, Flask, Django, Node/Express, static HTML served live.
+
+Decision rules (in order of priority):
+1. If the requirement clearly describes an HTTP API, server, or web endpoint → "web".
+2. If the requirement names a compiled language (C/C++/Rust/Go/Java/...) → "compiled".
+3. Otherwise → "simple".
+
+Trust the Planner's metadata, but OVERRIDE it when the raw requirement \
+clearly contradicts it (e.g., planner says "simple" but the user asked \
+for a FastAPI endpoint). Set overrode_planner=true when you do.
+
+Respond ONLY as JSON matching this schema:
+{{
+  "executor": "simple" | "compiled" | "web",
+  "reason": "<one short sentence>",
+  "overrode_planner": true | false
+}}
+"""
+
+_USER_PROMPT = """User Requirement:
+{user_requirement}
+
+Planner Classification:
+- project_type: {project_type}
+- language: {language}
+- needs_server: {needs_server}
+- needs_compilation: {needs_compilation}
+- needs_dependencies: {needs_dependencies}
+
+Choose the best executor."""
+
+
+
+def orchestrator_node(state: AgentState) -> dict:
+    """
+    LLM-driven routing decision.
+
+    No fallback: if the LLM call fails or returns an invalid executor,
+    the exception propagates so the workflow surfaces the real problem
+    instead of silently routing to a default.
 
     Returns a state delta:
         {
             "route": "simple" | "compiled" | "web",
-            "logs": ["Router: ..."]
+            "logs":  ["Orchestrator: ..."]
         }
     """
-    logger.info("--- ROUTER NODE EXECUTING ---")
+    logger.info("--- ORCHESTRATOR AGENT EXECUTING ---")
 
-    try:
-        route, reason = _decide_route(state)
-    except Exception as exc:
-        # Defensive: any unexpected error → default route + warning
-        logger.exception("Router crashed; using default route")
-        return {
-            "route": DEFAULT_ROUTE,
-            "logs": [
-                f"Router: ERROR ({exc}); defaulted to '{DEFAULT_ROUTE}'"
-            ],
-        }
-
-    # Sanity check — should never trigger, but defense in depth
-    if route not in VALID_ROUTES:
-        logger.error(
-            "Router produced invalid route %r; falling back to %r",
-            route, DEFAULT_ROUTE,
-        )
-        route = DEFAULT_ROUTE
-        reason = f"invalid route detected; defaulted to '{DEFAULT_ROUTE}'"
-
-    log_msg = f"Router: route='{route}' — {reason}"
-    logger.info(log_msg)
-
-    return {
-        "route": route,
-        "logs": [log_msg],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Decision logic
-# ---------------------------------------------------------------------------
-
-def _decide_route(state: AgentState) -> Tuple[str, str]:
-    """
-    Apply the routing rules and return (route, human_readable_reason).
-
-    Priority order (highest to lowest):
-      1. needs_server=True → WEB (server-aware execution required)
-      2. needs_compilation=True → COMPILED (compile+run required)
-      3. project_type hint → matching route
-      4. language hint → matching route
-      5. Default → SIMPLE
-    """
-    # ─── Extract metadata defensively ────────────────────────────────────
     metadata = _extract_metadata(state)
 
-    needs_server = metadata["needs_server"]
-    needs_compilation = metadata["needs_compilation"]
-    project_type = metadata["project_type"]
-    language = metadata["language"]
-    plan_length = metadata["plan_length"]
+    decision = _llm_decide(metadata)
+    route = decision.executor.strip().lower()
 
-    # ─── Guard: empty plan ───────────────────────────────────────────────
-    if plan_length == 0:
-        return DEFAULT_ROUTE, "empty plan; defaulted to 'simple'"
-
-    # ─── Rule 1: needs_server is the strongest signal ────────────────────
-    if needs_server:
-        return ROUTE_WEB, f"needs_server=True (project_type='{project_type}')"
-
-    # ─── Rule 2: needs_compilation forces compiled branch ────────────────
-    if needs_compilation:
-        return ROUTE_COMPILED, (
-            f"needs_compilation=True "
-            f"(language='{language}', project_type='{project_type}')"
+    if route not in VALID_ROUTES:
+        raise ValueError(
+            f"Orchestrator LLM returned invalid executor: {route!r}. "
+            f"Expected one of {sorted(VALID_ROUTES)}."
         )
 
-    # ─── Rule 3: explicit project_type mapping ───────────────────────────
-    project_type_map = {
-        "application": ROUTE_WEB,
-        "web":         ROUTE_WEB,
-        "compiled":    ROUTE_COMPILED,
-        "script":      ROUTE_SIMPLE,
-        "utility":     ROUTE_SIMPLE,
-    }
-    if project_type in project_type_map:
-        chosen = project_type_map[project_type]
-        return chosen, f"project_type='{project_type}' → '{chosen}'"
+    tag = " [OVERRODE PLANNER]" if decision.overrode_planner else ""
+    log_msg = f"Orchestrator: route='{route}'{tag} — {decision.reason}"
+    logger.info(log_msg)
 
-    # ─── Rule 4: language hint when classification is missing ────────────
-    language_map = {
-        "c": ROUTE_COMPILED, "cpp": ROUTE_COMPILED,
-        "rust": ROUTE_COMPILED, "go": ROUTE_COMPILED,
-        "java": ROUTE_COMPILED, "csharp": ROUTE_COMPILED,
-        "swift": ROUTE_COMPILED, "kotlin": ROUTE_COMPILED,
-    }
-    if language in language_map:
-        chosen = language_map[language]
-        return chosen, (
-            f"language='{language}' implies compiled execution"
-        )
+    return {"route": route, "logs": [log_msg]}
 
-    # ─── Rule 5: default fallback ────────────────────────────────────────
-    return DEFAULT_ROUTE, (
-        f"no decisive signals (project_type='{project_type}', "
-        f"language='{language}'); defaulted to '{DEFAULT_ROUTE}'"
-    )
+
+
+def _llm_decide(metadata: Dict[str, Any]) -> OrchestratorDecision:
+    """Call the LLM with structured output. Raises on any failure."""
+    model = llm
+    structured_llm = model.with_structured_output(OrchestratorDecision)
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", _SYSTEM_PROMPT),
+        ("user", _USER_PROMPT),
+    ])
+
+    chain = prompt | structured_llm
+
+    decision = chain.invoke({
+        "user_requirement":    metadata["user_requirement"],
+        "project_type":        metadata["project_type"],
+        "language":            metadata["language"],
+        "needs_server":        metadata["needs_server"],
+        "needs_compilation":   metadata["needs_compilation"],
+        "needs_dependencies":  metadata["needs_dependencies"],
+    })
+
+    if not isinstance(decision, OrchestratorDecision):
+        # Some providers return a dict instead of a model instance
+        decision = OrchestratorDecision.model_validate(decision)
+
+    return decision
 
 
 # ---------------------------------------------------------------------------
-# Defensive metadata extraction
+# Metadata extraction
 # ---------------------------------------------------------------------------
 
 def _extract_metadata(state: Any) -> Dict[str, Any]:
-    """
-    Pull routing-relevant fields from state with type-safe defaults.
-
-    Handles every malformed-input scenario:
-      - state is None
-      - state is missing fields
-      - fields have wrong types (str instead of bool, etc.)
-      - state is not a dict at all
-    """
-    # Treat anything non-dict as empty
+    """Pull routing-relevant fields with type-safe defaults for the prompt."""
     if not isinstance(state, dict):
-        logger.warning("Router received non-dict state (%s); using defaults",
-                       type(state).__name__)
-        state = {}
+        raise TypeError(
+            f"Orchestrator expected dict state, got {type(state).__name__}"
+        )
 
     return {
-        "needs_server":      _to_bool(state.get("needs_server"), default=False),
-        "needs_compilation": _to_bool(state.get("needs_compilation"), default=False),
-        "project_type":      _to_str(state.get("project_type"), default="unknown"),
-        "language":          _to_str(state.get("language"), default="unknown"),
-        "plan_length":       _to_plan_length(state.get("plan")),
+        "user_requirement":   _to_str(state.get("user_requirement"), default=""),
+        "needs_server":       _to_bool(state.get("needs_server"), default=False),
+        "needs_compilation":  _to_bool(state.get("needs_compilation"), default=False),
+        "needs_dependencies": _to_bool(state.get("needs_dependencies"), default=False),
+        "project_type":       _to_str(state.get("project_type"), default="unknown"),
+        "language":           _to_str(state.get("language"), default="unknown"),
     }
 
 
 def _to_bool(value: Any, default: bool) -> bool:
-    """Coerce a value to bool, accepting common LLM-output formats."""
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
         v = value.strip().lower()
-        if v in ("true", "yes", "1"):
-            return True
-        if v in ("false", "no", "0", ""):
-            return False
+        if v in ("true", "yes", "1"):  return True
+        if v in ("false", "no", "0", ""): return False
     if isinstance(value, (int, float)):
         return bool(value)
     return default
 
 
 def _to_str(value: Any, default: str) -> str:
-    """Coerce a value to a normalized lowercase string."""
     if not isinstance(value, str):
         return default
-    cleaned = value.strip().lower()
+    cleaned = value.strip()
     return cleaned if cleaned else default
-
-
-def _to_plan_length(plan: Any) -> int:
-    """Safely compute plan length regardless of type."""
-    if isinstance(plan, list):
-        return len(plan)
-    return 0

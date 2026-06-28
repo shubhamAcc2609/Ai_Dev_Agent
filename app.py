@@ -22,7 +22,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 
@@ -589,19 +589,33 @@ with st.sidebar:
     st.markdown("---")
 
     st.markdown(
-        """
-        <div class='arch-path' style='text-align: left; font-size: 0.85rem;'>
-        <b style='color: #fbbf24;'>Planner</b><br>
-        &nbsp;&nbsp;↓<br>
-        <b style='color: #06b6d4;'>Router</b><br>
-        &nbsp;&nbsp;↓<br>
-        ├─ <span style='color: #4ade80;'>Simple</span><br>
-        ├─ <span style='color: #f472b6;'>Compiled</span><br>
-        └─ <span style='color: #60a5fa;'>Web</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    """
+    <div class='arch-path' style='text-align: left; font-size: 0.82rem; line-height: 1.55;'>
+    <b style='color: #fbbf24;'>Planner</b><br>
+    &nbsp;&nbsp;↓<br>
+    <b style='color: #06b6d4;'>Orchestrator Agent</b><br>
+    &nbsp;&nbsp;↓<br>
+    ├─ <span style='color: #4ade80;'>Simple Executor</span><br>
+    ├─ <span style='color: #f472b6;'>Compiled Executor</span><br>
+    └─ <span style='color: #60a5fa;'>Web Executor</span><br>
+    &nbsp;&nbsp;↓<br>
+    <b style='color: #a78bfa;'>Execution Result?</b><br>
+    &nbsp;&nbsp;├─ <span style='color: #4ade80;'>✓ Success</span> → <b style='color: #4ade80;'>END</b><br>
+    &nbsp;&nbsp;└─ <span style='color: #f87171;'>✗ Failure</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;↓<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<b style='color: #fb923c;'>Error Analyzer</b><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;↓<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<b style='color: #fb923c;'>Fix Generator</b><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;↓<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<b style='color: #06b6d4;'>Re-execute</b><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;↓<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;<span style='color: #fbbf24;'>Retries &lt; 3?</span><br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├─ <span style='color: #4ade80;'>Yes</span> → retry loop<br>
+    &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└─ <span style='color: #f87171;'>No</span> → <b style='color: #fbbf24;'>Replan</b>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
     st.markdown("### 🛠️ Host Tools")
 
