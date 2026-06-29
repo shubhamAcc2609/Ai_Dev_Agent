@@ -73,8 +73,22 @@ D. COMPILED LANGUAGE PROGRAM (project_type: "compiled")
    Examples: "C program to print primes", "Rust hash map demo".
    → 2-4 steps, one source file, compile + run.
 
+   
+
 NEVER inflate a Type A problem into Type C. If the requirement fits in one
 file with stdlib only, the plan is SMALL.
+
+
+A project should be classified as project_type='web' if it involves:
+- FastAPI, Flask, Django, Streamlit (Python)
+- Express, NestJS, Fastify, Koa (Node.js)
+- Next.js, Vite, React dev servers
+- Any code that starts an HTTP server
+
+For Node.js projects, set:
+- language: 'javascript' or 'typescript'
+- needs_server: true
+- needs_dependencies: true (for npm install)
 
 HARD RULES:
 1. Each step is ATOMIC — a single create_file, update_file, or execute_command.

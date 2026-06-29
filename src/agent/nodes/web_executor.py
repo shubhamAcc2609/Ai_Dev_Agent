@@ -91,6 +91,7 @@ INSTALL_PREFIXES = (
 # name to be followed by whitespace or end-of-line so `uvicorn-config-gen`
 # doesn't accidentally match.
 SERVER_PATTERNS = (
+    
     re.compile(r"\buvicorn(?:\s|$)", re.IGNORECASE),
     re.compile(r"\bgunicorn(?:\s|$)", re.IGNORECASE),
     re.compile(r"\bhypercorn(?:\s|$)", re.IGNORECASE),
@@ -98,6 +99,15 @@ SERVER_PATTERNS = (
     re.compile(r"\bflask\s+run\b", re.IGNORECASE),
     re.compile(r"\bstreamlit\s+run\b", re.IGNORECASE),
     re.compile(r"\bpython\s+-m\s+http\.server\b", re.IGNORECASE),
+
+    
+    re.compile(r"\bnode\s+\S+\.(?:js|mjs|cjs)\b", re.IGNORECASE),
+    re.compile(r"\bnpm\s+(?:start|run\s+dev|run\s+start)\b", re.IGNORECASE),
+    re.compile(r"\bnpx\s+(?:vite|next|nodemon)\b", re.IGNORECASE),
+    re.compile(r"\byarn\s+(?:start|dev)\b", re.IGNORECASE),
+    re.compile(r"\bpnpm\s+(?:start|dev|run\s+start)\b", re.IGNORECASE),
+    re.compile(r"\bdeno\s+run\b", re.IGNORECASE),
+    re.compile(r"\bbun\s+(?:run|start)\b", re.IGNORECASE),
 )
 
 # Regex to pull a planned target URL out of a command (curl, wget, etc.)
